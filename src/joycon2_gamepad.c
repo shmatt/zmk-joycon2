@@ -211,6 +211,17 @@ static const struct joycon2_profile_map duo_right = {
         },
 };
 
+/* Per-side, because in duo both halves report independently: sharing this
+ * would make each half's report suppress the other's. */
+struct joycon2_side_state {
+    bool have_last;
+    uint32_t last_buttons;
+    int8_t last_x;
+    int8_t last_y;
+};
+
+static struct joycon2_side_state side_state[2];
+
 static enum zmk_joycon2_profile current_profile = ZMK_JOYCON2_PROFILE_SOLO;
 
 static const struct joycon2_profile_map *map_for(enum zmk_joycon2_side side) {
@@ -268,16 +279,6 @@ static int8_t scale_axis(uint16_t raw) {
     return (int8_t)CLAMP((centred * 127) / span, -127, 127);
 }
 
-/* Per-side, because in duo both halves report independently: sharing this
- * would make each half's report suppress the other's. */
-struct joycon2_side_state {
-    bool have_last;
-    uint32_t last_buttons;
-    int8_t last_x;
-    int8_t last_y;
-};
-
-static struct joycon2_side_state side_state[2];
 
 void zmk_joycon2_gamepad_update(enum zmk_joycon2_side side, uint32_t buttons, uint16_t stick_x_raw,
                                  uint16_t stick_y_raw) {
