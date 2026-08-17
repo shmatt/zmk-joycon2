@@ -136,8 +136,11 @@ static const struct joycon2_profile_map solo_left = {
             [PAD_FACE_UP] = JC2_UP,
             [PAD_L1] = JC2_L,
             [PAD_L2] = JC2_ZL,
-            [PAD_R1] = JC2_SR_L,
-            [PAD_R2] = JC2_SL_L,
+            /* Swapped relative to the right half: held upright, the left
+             * half's rail is mirrored, so SL is the one that falls under
+             * the finger first. */
+            [PAD_R1] = JC2_SL_L,
+            [PAD_R2] = JC2_SR_L,
             [PAD_START] = JC2_CAPTURE,
             [PAD_MODE] = JC2_MINUS,
             [PAD_THUMBL] = JC2_LSTK,

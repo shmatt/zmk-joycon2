@@ -83,6 +83,13 @@ enum handshake_step {
     HANDSHAKE_IMU_1,
     HANDSHAKE_IMU_2,
     HANDSHAKE_SUBSCRIBE_INPUT,
+    /* Bonding runs last, after input is already streaming, so that if it
+     * ever disturbs the stream the cause is unambiguous. It only affects
+     * reconnection, never this session. */
+    HANDSHAKE_BOND_SET_MAC,
+    HANDSHAKE_BOND_LTK1,
+    HANDSHAKE_BOND_LTK2,
+    HANDSHAKE_BOND_FINISH,
     HANDSHAKE_DONE,
 };
 
@@ -110,6 +117,11 @@ static void hex_encode_and_print(const char *prefix, const uint8_t *data, uint16
 struct eir_parse_ctx {
     bool found;
     enum zmk_joycon2_side side;
+    /* The host this controller is bonded to, taken straight from the
+     * advertisement; all-zero means it is in pairing mode. Same byte order
+     * as Zephyr's bt_addr_le_t, so it compares directly against a.val. */
+    bool have_bond_addr;
+    uint8_t bond_addr[6];
 };
 
 /* Byte 5 of the manufacturer payload (after the 2-byte company ID)
@@ -118,6 +130,14 @@ struct eir_parse_ctx {
 #define JOYCON2_AD_SIDE_OFFSET 5
 #define JOYCON2_AD_SIDE_RIGHT 0x66
 #define JOYCON2_AD_SIDE_LEFT 0x67
+
+/* Bytes 10..15 of the manufacturer payload carry the address of the host the
+ * controller has been bonded to, and are all-zero while it is in pairing
+ * mode. Confirmed against a capture taken with SYNC held, which read as all
+ * zeroes. This is what makes a sync-free reconnect possible: we can tell
+ * "waiting for us" from "bonded to something else" before connecting. */
+#define JOYCON2_AD_BOND_ADDR_OFFSET 10
+#define JOYCON2_AD_BOND_ADDR_LEN 6
 
 static bool eir_parse_cb(struct bt_data *data, void *user_data) {
     struct eir_parse_ctx *ctx = user_data;
@@ -138,6 +158,12 @@ static bool eir_parse_cb(struct bt_data *data, void *user_data) {
 
     const uint8_t *mfg = &data->data[2];
     uint8_t mfg_len = data->data_len - 2;
+
+    if (mfg_len >= JOYCON2_AD_BOND_ADDR_OFFSET + JOYCON2_AD_BOND_ADDR_LEN) {
+        memcpy(ctx->bond_addr, &mfg[JOYCON2_AD_BOND_ADDR_OFFSET], JOYCON2_AD_BOND_ADDR_LEN);
+        ctx->have_bond_addr = true;
+    }
+
     if (mfg_len > JOYCON2_AD_SIDE_OFFSET) {
         switch (mfg[JOYCON2_AD_SIDE_OFFSET]) {
         case JOYCON2_AD_SIDE_LEFT:
@@ -345,8 +371,68 @@ static void handshake_work_handler(struct k_work *work) {
     case HANDSHAKE_SUBSCRIBE_INPUT:
         subscribe_input();
         zmk_joycon2_debug_print("JC2 HANDSHAKE SENT");
+        if (!IS_ENABLED(CONFIG_ZMK_JOYCON2_BOND)) {
+            handshake_step = HANDSHAKE_DONE;
+            return;
+        }
+        break;
+
+#if IS_ENABLED(CONFIG_ZMK_JOYCON2_BOND)
+    case HANDSHAKE_BOND_SET_MAC: {
+        /* Stores this host's address on the controller so it will wake and
+         * reconnect to us on a button press instead of needing SYNC held.
+         * The reference sends the host address twice, little-endian --
+         * which is exactly Zephyr's bt_addr_le_t byte order, so a.val goes
+         * out as-is. (An earlier attempt reversed it, i.e. sent it
+         * backwards, which would explain why bonding never took.) */
+        bt_addr_le_t addrs[CONFIG_BT_ID_MAX];
+        size_t count = ARRAY_SIZE(addrs);
+
+        bt_id_get(addrs, &count);
+        if (count == 0) {
+            LOG_ERR("joycon2: no local BT identity address");
+            zmk_joycon2_debug_print("JC2 NO LOCAL BT ADDR");
+            handshake_step = HANDSHAKE_DONE;
+            return;
+        }
+
+        uint8_t buf[22] = {0x15, 0x91, 0x01, 0x01, 0x00, 0x0E, 0x00, 0x00, 0x00, 0x02};
+        memcpy(&buf[10], addrs[0].a.val, 6);
+        memcpy(&buf[16], addrs[0].a.val, 6);
+
+        err = jc_write_command(buf, sizeof(buf));
+        LOG_INF("joycon2: bond set-mac (%d)", err);
+        break;
+    }
+    case HANDSHAKE_BOND_LTK1: {
+        /* Opaque 16-byte key the host chooses; the reference implementations
+         * each ship a different constant, which is how we know these are
+         * not captured console secrets. */
+        static const uint8_t cmd[] = {0x15, 0x91, 0x01, 0x04, 0x00, 0x11, 0x00, 0x00, 0x00,
+                                       0xEA, 0xBD, 0x47, 0x13, 0x89, 0x35, 0x42, 0xC6, 0x79,
+                                       0xEE, 0x07, 0xF2, 0x53, 0x2C, 0x6C, 0x31};
+        err = jc_write_command(cmd, sizeof(cmd));
+        LOG_INF("joycon2: bond ltk1 (%d)", err);
+        break;
+    }
+    case HANDSHAKE_BOND_LTK2: {
+        static const uint8_t cmd[] = {0x15, 0x91, 0x01, 0x02, 0x00, 0x11, 0x00, 0x00, 0x00,
+                                       0x40, 0xB0, 0x8A, 0x5F, 0xCD, 0x1F, 0x9B, 0x41, 0x12,
+                                       0x5C, 0xAC, 0xC6, 0x3F, 0x38, 0xA0, 0x73};
+        err = jc_write_command(cmd, sizeof(cmd));
+        LOG_INF("joycon2: bond ltk2 (%d)", err);
+        break;
+    }
+    case HANDSHAKE_BOND_FINISH: {
+        static const uint8_t cmd[] = {0x15, 0x91, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00};
+        err = jc_write_command(cmd, sizeof(cmd));
+        LOG_INF("joycon2: bond commit (%d)", err);
+        zmk_joycon2_debug_print("JC2 BOND SENT");
         handshake_step = HANDSHAKE_DONE;
         return;
+    }
+#endif // IS_ENABLED(CONFIG_ZMK_JOYCON2_BOND)
+
     default:
         return;
     }
@@ -473,6 +559,32 @@ static void scan_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
     if (!ctx.found) {
         return;
     }
+
+    /* Skip controllers bonded to a different host: they are advertising for
+     * that host, not for us, and grabbing them would steal them from it.
+     * A controller in pairing mode advertises an all-zero address and is
+     * fair game, as is one already bonded to us. */
+    if (ctx.have_bond_addr) {
+        bt_addr_le_t self[CONFIG_BT_ID_MAX];
+        size_t count = ARRAY_SIZE(self);
+        static const uint8_t no_bond[JOYCON2_AD_BOND_ADDR_LEN] = {0};
+
+        bt_id_get(self, &count);
+
+        bool pairing_mode = memcmp(ctx.bond_addr, no_bond, sizeof(no_bond)) == 0;
+        bool bonded_to_us =
+            count > 0 && memcmp(ctx.bond_addr, self[0].a.val, JOYCON2_AD_BOND_ADDR_LEN) == 0;
+
+        if (!pairing_mode && !bonded_to_us) {
+            if (zmk_joycon2_debug_input_logging_enabled()) {
+                hex_encode_and_print("JC2 SKIP BONDED", ctx.bond_addr, sizeof(ctx.bond_addr));
+            }
+            return;
+        }
+
+        zmk_joycon2_debug_print(pairing_mode ? "JC2 PAIRMODE" : "JC2 REMEMBERS US");
+    }
+
     jc_side = ctx.side;
 
     struct bt_conn *existing = bt_conn_lookup_addr_le(BT_ID_DEFAULT, addr);

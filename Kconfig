@@ -25,6 +25,16 @@ config ZMK_JOYCON2_CONNECT
     depends on ZMK_JOYCON2_DEBUG_PRINT
     default y
 
+config ZMK_JOYCON2_BOND
+    bool "Store this host on the controller so it reconnects without SYNC"
+    depends on ZMK_JOYCON2_CONNECT
+    # Sends the controller's proprietary pairing sequence (host address plus
+    # two host-chosen keys) after input is already streaming. Affects only
+    # future reconnections, never the current session: once bonded the
+    # controller advertises this host's address and wakes for it on a button
+    # press, instead of needing SYNC held every time.
+    default y
+
 config ZMK_JOYCON2_GAMEPAD
     bool "Expose decoded Joy-Con 2 input to the host as a gamepad"
     depends on ZMK_JOYCON2_CONNECT
