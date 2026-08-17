@@ -28,8 +28,10 @@ LOG_MODULE_REGISTER(joycon2_connection, CONFIG_ZMK_LOG_LEVEL);
 
 /* GATT layout confirmed by hand via nRF Connect against a real Joy-Con 2,
  * cross-checked against github.com/OZORDI/JoyCon2Mac's BLEManager.mm (which
- * uses the identical UUIDs). The device advertises with NO name, so the
- * scan filter below matches on the service UUID instead. */
+ * uses the identical UUIDs). These are only visible via discovery *after*
+ * connecting -- the device's advertisement carries no service UUID at all,
+ * so the scan filter below matches on manufacturer data instead (see
+ * JOYCON2_NINTENDO_COMPANY_ID below). */
 #define JOYCON2_UUID_SERVICE_VAL BT_UUID_128_ENCODE(0xab7de9be, 0x89fe, 0x49ad, 0x828f, 0x118f09df7fd0)
 #define JOYCON2_UUID_INPUT_VAL BT_UUID_128_ENCODE(0xab7de9be, 0x89fe, 0x49ad, 0x828f, 0x118f09df7fd2)
 #define JOYCON2_UUID_COMMAND_VAL BT_UUID_128_ENCODE(0x649d4ac9, 0x8eb7, 0x4e6c, 0xaf44, 0x1ea54fe5f005)
@@ -41,6 +43,7 @@ static const struct bt_uuid_128 joycon2_uuid_command = BT_UUID_INIT_128(JOYCON2_
 static const struct bt_uuid_128 joycon2_uuid_response = BT_UUID_INIT_128(JOYCON2_UUID_RESPONSE_VAL);
 
 #define JOYCON2_SCAN_TIMEOUT_SEC 20
+#define JOYCON2_CONNECT_TIMEOUT_SEC 15
 #define JOYCON2_HANDSHAKE_STEP_DELAY_MS 500
 
 static struct bt_conn *jc_conn;
@@ -54,6 +57,7 @@ static struct bt_gatt_subscribe_params input_subscribe_params;
 static struct bt_gatt_subscribe_params response_subscribe_params;
 
 static struct k_work_delayable scan_timeout_work;
+static struct k_work_delayable connect_timeout_work;
 static struct k_work_delayable handshake_work;
 
 enum handshake_step {
@@ -148,10 +152,14 @@ static uint8_t chrc_discovery_func(struct bt_conn *conn, const struct bt_gatt_at
         LOG_INF("joycon2: characteristic discovery complete");
         memset(params, 0, sizeof(*params));
 
+        char msg[64];
+        snprintf(msg, sizeof(msg), "JC2 CHRC in=%u cmd=%u resp=%u",
+                 input_subscribe_params.value_handle, command_value_handle,
+                 response_subscribe_params.value_handle);
+        zmk_joycon2_debug_print(msg);
+
         if (command_value_handle) {
             start_handshake();
-        } else {
-            zmk_joycon2_debug_print("JC2 COMMAND CHRC NOT FOUND");
         }
         return BT_GATT_ITER_STOP;
     }
@@ -197,6 +205,7 @@ static uint8_t service_discovery_func(struct bt_conn *conn, const struct bt_gatt
     }
 
     LOG_INF("joycon2: service found, discovering characteristics");
+    zmk_joycon2_debug_print("JC2 SERVICE FOUND");
 
     discover_params.uuid = NULL;
     discover_params.func = chrc_discovery_func;
@@ -353,7 +362,15 @@ static void scan_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
         LOG_ERR("joycon2: create conn failed (%d)", err);
         jc_connecting = false;
         zmk_joycon2_debug_print("JC2 CREATE CONN FAILED");
+        return;
     }
+
+    zmk_joycon2_debug_print("JC2 FOUND CONNECTING");
+    /* Independent watchdog: don't rely solely on whatever internal timeout
+     * bt_conn_le_create()'s default create params use -- if neither
+     * jc_connected nor jc_disconnected ever fires, this guarantees we
+     * eventually report *something* instead of hanging silently. */
+    k_work_schedule(&connect_timeout_work, K_SECONDS(JOYCON2_CONNECT_TIMEOUT_SEC));
 }
 
 static void scan_timeout_work_handler(struct k_work *work) {
@@ -368,10 +385,27 @@ static void scan_timeout_work_handler(struct k_work *work) {
     jc_connecting = false;
 }
 
+static void connect_timeout_work_handler(struct k_work *work) {
+    ARG_UNUSED(work);
+
+    if (jc_conn == NULL) {
+        return;
+    }
+
+    LOG_ERR("joycon2: connect attempt timed out");
+    bt_conn_disconnect(jc_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+    bt_conn_unref(jc_conn);
+    jc_conn = NULL;
+    jc_connecting = false;
+    zmk_joycon2_debug_print("JC2 CONNECT TIMEOUT");
+}
+
 static void jc_connected(struct bt_conn *conn, uint8_t err) {
     if (conn != jc_conn) {
         return;
     }
+
+    k_work_cancel_delayable(&connect_timeout_work);
 
     if (err) {
         LOG_ERR("joycon2: connect failed (err %d)", err);
@@ -383,6 +417,7 @@ static void jc_connected(struct bt_conn *conn, uint8_t err) {
     }
 
     LOG_INF("joycon2: connected, discovering service");
+    zmk_joycon2_debug_print("JC2 CONNECTED");
 
     memset(&discover_params, 0, sizeof(discover_params));
     discover_params.uuid = &joycon2_uuid_service.uuid;
@@ -404,6 +439,7 @@ static void jc_disconnected(struct bt_conn *conn, uint8_t reason) {
     }
 
     LOG_INF("joycon2: disconnected (reason %d)", reason);
+    k_work_cancel_delayable(&connect_timeout_work);
     bt_conn_unref(jc_conn);
     jc_conn = NULL;
     jc_connecting = false;
@@ -453,6 +489,7 @@ int zmk_joycon2_connection_start(void) {
 
 static int joycon2_connection_init(void) {
     k_work_init_delayable(&scan_timeout_work, scan_timeout_work_handler);
+    k_work_init_delayable(&connect_timeout_work, connect_timeout_work_handler);
     k_work_init_delayable(&handshake_work, handshake_work_handler);
     bt_conn_cb_register(&jc_conn_callbacks);
     return 0;
