@@ -1,0 +1,9 @@
+description: |
+  Joy-Con 2 debug-print behavior. When pressed, types a canned debug message
+  (selected by param1, indexing into a fixed message table) via ZMK's HID
+  keyboard report path, one character at a time, into whatever field has
+  focus on the host.
+
+compatible: "zmk,behavior-joycon2-debug-print"
+
+include: one_param.yaml

@@ -1,0 +1,11 @@
+config ZMK_JOYCON2
+    bool "Joy-Con 2 controller support"
+    default y
+
+if ZMK_JOYCON2
+
+config ZMK_JOYCON2_DEBUG_PRINT
+    bool "HID debug-print helper (types debug text as keystrokes via the host HID connection)"
+    default y
+
+endif # ZMK_JOYCON2

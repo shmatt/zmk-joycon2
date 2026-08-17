@@ -1,0 +1,8 @@
+/ {
+    behaviors {
+        joycon2_debug_print: joycon2_debug_print {
+            compatible = "zmk,behavior-joycon2-debug-print";
+            #binding-cells = <1>;
+        };
+    };
+};
