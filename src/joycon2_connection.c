@@ -50,8 +50,6 @@ static const struct bt_uuid_128 joycon2_uuid_response = BT_UUID_INIT_128(JOYCON2
 static struct bt_conn *jc_conn;
 static bool jc_connecting;
 static uint16_t command_value_handle;
-static uint16_t target_service_start_handle;
-static uint16_t target_service_end_handle;
 
 static struct bt_gatt_discover_params discover_params;
 static struct bt_gatt_discover_params input_ccc_disc_params;
@@ -214,39 +212,40 @@ static uint8_t service_discovery_func(struct bt_conn *conn, const struct bt_gatt
                                        struct bt_gatt_discover_params *params) {
     ARG_UNUSED(params);
 
-    if (attr) {
-        /* Discovering ALL primary services (not filtering by UUID up front)
-         * to match how every client known to work against this device
-         * actually behaves -- both JoyCon2Mac (CoreBluetooth
-         * discoverServices:nil) and Android/nRF Connect enumerate every
-         * service before touching characteristics, unlike a single
-         * UUID-filtered lookup. Remember our target service's own handle
-         * range when we see it; keep iterating regardless. */
-        struct bt_gatt_service_val *service_val = attr->user_data;
-        if (bt_uuid_cmp(service_val->uuid, &joycon2_uuid_service.uuid) == 0) {
-            target_service_start_handle = attr->handle + 1;
-            target_service_end_handle = service_val->end_handle;
-        }
-        return BT_GATT_ITER_CONTINUE;
-    }
-
-    /* attr == NULL: primary service enumeration complete. */
-    k_work_cancel_delayable(&discover_timeout_work);
-    memset(&discover_params, 0, sizeof(discover_params));
-
-    if (target_service_start_handle == 0) {
+    if (!attr) {
         LOG_ERR("joycon2: service not found");
         zmk_joycon2_debug_print("JC2 SERVICE NOT FOUND");
+        memset(&discover_params, 0, sizeof(discover_params));
         return BT_GATT_ITER_STOP;
     }
+
+    /* Reverting to a targeted UUID-filtered lookup (ATT_FIND_BY_TYPE_VALUE)
+     * -- this reliably worked twice; switching to "discover all services"
+     * (ATT_READ_BY_GROUP_TYPE) made things WORSE (this call never got a
+     * response at all). Combined with characteristic discovery
+     * (ATT_READ_BY_TYPE) also never getting a response, the pattern is:
+     * this device answers FIND_BY_TYPE_VALUE reliably but not
+     * READ_BY_TYPE/READ_BY_GROUP_TYPE -- yet Android's nRF Connect *did*
+     * fully enumerate this same device using (presumably) the same
+     * standard ATT operations. The one concrete difference spotted in that
+     * working session's own connection log: Android negotiated a much
+     * faster interval (7.5ms) than we request below -- worth testing
+     * whether this device's firmware has tight timing margins for
+     * preparing enumeration-style responses. */
+    k_work_cancel_delayable(&discover_timeout_work);
+
+    struct bt_gatt_service_val *service_val = attr->user_data;
+    uint16_t chrc_start_handle = attr->handle + 1;
+    uint16_t chrc_end_handle = service_val->end_handle;
 
     LOG_INF("joycon2: service found, discovering characteristics");
     zmk_joycon2_debug_print("JC2 SERVICE FOUND");
 
+    memset(&discover_params, 0, sizeof(discover_params));
     discover_params.uuid = NULL;
     discover_params.func = chrc_discovery_func;
-    discover_params.start_handle = target_service_start_handle;
-    discover_params.end_handle = target_service_end_handle;
+    discover_params.start_handle = chrc_start_handle;
+    discover_params.end_handle = chrc_end_handle;
     discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
 
     int err = bt_gatt_discover(conn, &discover_params);
@@ -394,7 +393,13 @@ static void scan_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
     bt_le_scan_stop();
     k_work_cancel_delayable(&scan_timeout_work);
 
-    struct bt_le_conn_param *param = BT_LE_CONN_PARAM(0x0018, 0x0028, 0, 400);
+    /* 0x0006 = 7.5ms, the fastest interval BLE allows -- matches what
+     * Android's own BLE stack (nRF Connect) negotiated with this exact
+     * device in a session where full GATT enumeration worked. Previously
+     * requested 30-50ms; testing whether this device's firmware has tight
+     * timing margins for preparing enumeration-style responses. Timeout
+     * 500*10ms=5000ms also matches Android's observed supervision timeout. */
+    struct bt_le_conn_param *param = BT_LE_CONN_PARAM(0x0006, 0x0006, 0, 500);
     int err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN, param, &jc_conn);
     if (err) {
         LOG_ERR("joycon2: create conn failed (%d)", err);
@@ -478,13 +483,8 @@ static void jc_connected(struct bt_conn *conn, uint8_t err) {
         LOG_ERR("joycon2: MTU exchange request failed (%d)", mtu_err);
     }
 
-    target_service_start_handle = 0;
-    target_service_end_handle = 0;
-
     memset(&discover_params, 0, sizeof(discover_params));
-    /* Discover ALL primary services rather than filtering by our target
-     * UUID up front -- see service_discovery_func for why. */
-    discover_params.uuid = NULL;
+    discover_params.uuid = &joycon2_uuid_service.uuid;
     discover_params.func = service_discovery_func;
     discover_params.start_handle = 0x0001;
     discover_params.end_handle = 0xffff;
@@ -540,8 +540,13 @@ int zmk_joycon2_connection_start(void) {
 
     /* Immediate feedback that the combo registered at all, decoupled from
      * whatever the scan eventually finds (which can take up to
-     * JOYCON2_SCAN_TIMEOUT_SEC to resolve one way or the other). */
-    zmk_joycon2_debug_print("JC2 SCANNING");
+     * JOYCON2_SCAN_TIMEOUT_SEC to resolve one way or the other). Includes
+     * this build's git hash so a fast-iterating build/flash loop can't
+     * accidentally leave stale firmware ambiguity. */
+#ifndef ZMK_JOYCON2_GIT_HASH
+#define ZMK_JOYCON2_GIT_HASH "unknown"
+#endif
+    zmk_joycon2_debug_print("JC2 SCANNING " ZMK_JOYCON2_GIT_HASH);
 
     int err = bt_le_scan_start(BT_LE_SCAN_PASSIVE, scan_found);
     if (err) {

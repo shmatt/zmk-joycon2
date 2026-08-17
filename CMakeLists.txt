@@ -19,4 +19,18 @@ if(CONFIG_ZMK_JOYCON2 AND ((NOT CONFIG_ZMK_SPLIT) OR CONFIG_ZMK_SPLIT_ROLE_CENTR
     src/joycon2_connection.c
     src/behavior_joycon2_connect.c
   )
+
+  # Embeds this module's exact git commit so debug-print output can prove
+  # which build is actually running -- across a fast-iterating build/flash
+  # loop it's easy to accidentally test stale firmware.
+  execute_process(
+    COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR} rev-parse --short HEAD
+    OUTPUT_VARIABLE ZMK_JOYCON2_GIT_HASH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+  )
+  if(NOT ZMK_JOYCON2_GIT_HASH)
+    set(ZMK_JOYCON2_GIT_HASH "unknown")
+  endif()
+  zephyr_compile_definitions(ZMK_JOYCON2_GIT_HASH="${ZMK_JOYCON2_GIT_HASH}")
 endif()
