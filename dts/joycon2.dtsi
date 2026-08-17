@@ -4,5 +4,10 @@
             compatible = "zmk,behavior-joycon2-debug-print";
             #binding-cells = <1>;
         };
+
+        joycon2_central_test: joycon2_central_test {
+            compatible = "zmk,behavior-joycon2-central-test";
+            #binding-cells = <0>;
+        };
     };
 };

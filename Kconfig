@@ -8,4 +8,9 @@ config ZMK_JOYCON2_DEBUG_PRINT
     bool "HID debug-print helper (types debug text as keystrokes via the host HID connection)"
     default y
 
+config ZMK_JOYCON2_CENTRAL_TEST
+    bool "Stage 1 sub-stage 2: third BLE central role survival test"
+    depends on ZMK_JOYCON2_DEBUG_PRINT
+    default y
+
 endif # ZMK_JOYCON2

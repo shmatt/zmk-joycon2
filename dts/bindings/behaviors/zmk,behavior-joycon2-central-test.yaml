@@ -1,0 +1,12 @@
+description: |
+  Joy-Con 2 project Stage 1 sub-stage 2 test behavior. When pressed, starts a
+  one-shot BLE central scan and connects to the first connectable advertiser
+  found, to test whether a third concurrent BLE central role survives
+  alongside ZMK's existing host and split-half connections. Reports the
+  result (and current LE connection counts by role) via the debug-print
+  helper a couple of seconds after connecting, or after a 15s timeout if
+  nothing was found.
+
+compatible: "zmk,behavior-joycon2-central-test"
+
+include: zero_param.yaml
