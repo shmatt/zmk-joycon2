@@ -87,7 +87,9 @@ static struct k_work_delayable handshake_work;
 enum handshake_step {
     HANDSHAKE_IMU_1,
     HANDSHAKE_IMU_2,
+    HANDSHAKE_VIBRATION_CONFIG,
     HANDSHAKE_LED,
+    HANDSHAKE_PAIRING_VIBRATION,
     HANDSHAKE_MAC_1,
     HANDSHAKE_MAC_2,
     HANDSHAKE_MAC_3,
@@ -219,6 +221,19 @@ static void handshake_work_handler(struct k_work *work) {
         LOG_INF("joycon2: IMU enable step2 (%d)", err);
         break;
     }
+    case HANDSHAKE_VIBRATION_CONFIG: {
+        /* JoyCon2Mac's full pre-MAC-binding sequence is IMU-enable x2 ->
+         * vibration-config -> set-LED -> pairing-vibration, all gating the
+         * same "isInitialized" flag before MAC-binding fires -- we'd only
+         * been sending the LED step. Adding the other two in case they
+         * matter for unlocking input streaming specifically. */
+        static const uint8_t cmd[] = {0x0A, 0x91, 0x01, 0x08, 0x00, 0x14, 0x00, 0x00, 0x01, 0xFF,
+                                       0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x35, 0x00, 0x46,
+                                       0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+        err = jc_write_command(cmd, sizeof(cmd));
+        LOG_INF("joycon2: vibration config (%d)", err);
+        break;
+    }
     case HANDSHAKE_LED: {
         /* JoyCon2Mac sends this unconditionally right after IMU-enable,
          * before MAC-binding even starts, and treats it as part of
@@ -232,6 +247,13 @@ static void handshake_work_handler(struct k_work *work) {
                                        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
         err = jc_write_command(cmd, sizeof(cmd));
         LOG_INF("joycon2: set player LED (%d)", err);
+        break;
+    }
+    case HANDSHAKE_PAIRING_VIBRATION: {
+        static const uint8_t cmd[] = {0x0A, 0x91, 0x01, 0x02, 0x00, 0x04,
+                                       0x00, 0x00, 0x03, 0x00, 0x00, 0x00};
+        err = jc_write_command(cmd, sizeof(cmd));
+        LOG_INF("joycon2: pairing vibration (%d)", err);
         break;
     }
     case HANDSHAKE_MAC_1: {
@@ -362,11 +384,22 @@ static void mtu_exchange_cb(struct bt_conn *conn, uint8_t err,
                              struct bt_gatt_exchange_params *params) {
     ARG_UNUSED(params);
 
+    /* JoyConDecoder (the reference driver) needs a report of at least 62
+     * bytes to hold buttons+sticks+motion+battery -- if the negotiated ATT
+     * MTU can't fit that (MTU - 3 byte header must be >= 62), that alone
+     * could fully explain zero input notifications ever arriving despite
+     * a successful handshake. Surfacing this via debug-print since the
+     * previous LOG_INF was never actually visible without serial. */
+    char msg[32];
     if (err) {
         LOG_ERR("joycon2: MTU exchange failed (err %u)", err);
+        snprintf(msg, sizeof(msg), "JC2 MTU EXCHANGE FAILED %u", err);
     } else {
-        LOG_INF("joycon2: MTU exchange succeeded, ATT MTU=%u", bt_gatt_get_mtu(conn));
+        uint16_t mtu = bt_gatt_get_mtu(conn);
+        LOG_INF("joycon2: MTU exchange succeeded, ATT MTU=%u", mtu);
+        snprintf(msg, sizeof(msg), "JC2 MTU=%u", mtu);
     }
+    zmk_joycon2_debug_print(msg);
 
     start_subscriptions(conn);
 }
