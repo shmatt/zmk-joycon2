@@ -44,6 +44,7 @@ static const struct bt_uuid_128 joycon2_uuid_response = BT_UUID_INIT_128(JOYCON2
 
 #define JOYCON2_SCAN_TIMEOUT_SEC 20
 #define JOYCON2_CONNECT_TIMEOUT_SEC 15
+#define JOYCON2_DISCOVER_TIMEOUT_SEC 10
 #define JOYCON2_HANDSHAKE_STEP_DELAY_MS 500
 
 static struct bt_conn *jc_conn;
@@ -58,6 +59,7 @@ static struct bt_gatt_subscribe_params response_subscribe_params;
 
 static struct k_work_delayable scan_timeout_work;
 static struct k_work_delayable connect_timeout_work;
+static struct k_work_delayable chrc_discover_timeout_work;
 static struct k_work_delayable handshake_work;
 
 enum handshake_step {
@@ -150,6 +152,7 @@ static uint8_t chrc_discovery_func(struct bt_conn *conn, const struct bt_gatt_at
 
     if (!attr) {
         LOG_INF("joycon2: characteristic discovery complete");
+        k_work_cancel_delayable(&chrc_discover_timeout_work);
         memset(params, 0, sizeof(*params));
 
         char msg[64];
@@ -207,18 +210,28 @@ static uint8_t service_discovery_func(struct bt_conn *conn, const struct bt_gatt
     LOG_INF("joycon2: service found, discovering characteristics");
     zmk_joycon2_debug_print("JC2 SERVICE FOUND");
 
+    /* Scope discovery to just this service's own handle range rather than
+     * the full 0x0001-0xffff table (ZMK's own split-central code reuses the
+     * full range here, but that device only ever has one service; this one
+     * has several -- Generic Access/Attribute plus an unrelated config
+     * service alongside the target one -- and a full-range sweep crossing
+     * those boundaries never got a response on real hardware). */
+    struct bt_gatt_service_val *service_val = attr->user_data;
+
     discover_params.uuid = NULL;
     discover_params.func = chrc_discovery_func;
+    discover_params.start_handle = attr->handle + 1;
+    discover_params.end_handle = service_val->end_handle;
     discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
-    /* start/end handle left as the full range from service discovery,
-     * matching ZMK's own split-central discovery (central.c) rather than
-     * narrowing to the found service's own sub-range. */
 
     int err = bt_gatt_discover(conn, &discover_params);
     if (err) {
         LOG_ERR("joycon2: chrc discover failed (%d)", err);
         zmk_joycon2_debug_print("JC2 CHRC DISCOVER FAILED");
+        return BT_GATT_ITER_STOP;
     }
+
+    k_work_schedule(&chrc_discover_timeout_work, K_SECONDS(JOYCON2_DISCOVER_TIMEOUT_SEC));
     return BT_GATT_ITER_STOP;
 }
 
@@ -385,6 +398,18 @@ static void scan_timeout_work_handler(struct k_work *work) {
     jc_connecting = false;
 }
 
+static void chrc_discover_timeout_work_handler(struct k_work *work) {
+    ARG_UNUSED(work);
+
+    if (jc_conn == NULL) {
+        return;
+    }
+
+    LOG_ERR("joycon2: characteristic discovery timed out");
+    memset(&discover_params, 0, sizeof(discover_params));
+    zmk_joycon2_debug_print("JC2 CHRC DISCOVER TIMEOUT");
+}
+
 static void connect_timeout_work_handler(struct k_work *work) {
     ARG_UNUSED(work);
 
@@ -440,6 +465,7 @@ static void jc_disconnected(struct bt_conn *conn, uint8_t reason) {
 
     LOG_INF("joycon2: disconnected (reason %d)", reason);
     k_work_cancel_delayable(&connect_timeout_work);
+    k_work_cancel_delayable(&chrc_discover_timeout_work);
     bt_conn_unref(jc_conn);
     jc_conn = NULL;
     jc_connecting = false;
@@ -490,6 +516,7 @@ int zmk_joycon2_connection_start(void) {
 static int joycon2_connection_init(void) {
     k_work_init_delayable(&scan_timeout_work, scan_timeout_work_handler);
     k_work_init_delayable(&connect_timeout_work, connect_timeout_work_handler);
+    k_work_init_delayable(&chrc_discover_timeout_work, chrc_discover_timeout_work_handler);
     k_work_init_delayable(&handshake_work, handshake_work_handler);
     bt_conn_cb_register(&jc_conn_callbacks);
     return 0;
