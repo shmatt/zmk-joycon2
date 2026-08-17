@@ -192,7 +192,36 @@ static void joycon2_debug_print_work_handler(struct k_work *work) {
     k_work_schedule(&print_work, K_MSEC(JOYCON2_DEBUG_PRINT_STEP_DELAY_MS));
 }
 
+/* Off by default -- see the note in debug_print.h. */
+static bool logging_enabled;
+
+bool zmk_joycon2_debug_logging_enabled(void) { return logging_enabled; }
+
+/* The single gate for the whole channel. Gating here rather than at each
+ * call site means a newly added message cannot accidentally bypass it. */
+static int debug_print_raw(const char *str);
+
 int zmk_joycon2_debug_print(const char *str) {
+    if (!logging_enabled) {
+        return 0;
+    }
+    return debug_print_raw(str);
+}
+
+void zmk_joycon2_debug_logging_toggle(void) {
+    if (logging_enabled) {
+        /* Announce before disabling, or the message would be suppressed by
+         * the very change it reports. */
+        debug_print_raw("JC2 LOG OFF");
+        logging_enabled = false;
+        return;
+    }
+
+    logging_enabled = true;
+    debug_print_raw("JC2 LOG ON");
+}
+
+static int debug_print_raw(const char *str) {
     if (strlen(str) == 0) {
         return 0;
     }
@@ -224,21 +253,3 @@ static int joycon2_debug_print_init(void) {
 }
 
 SYS_INIT(joycon2_debug_print_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
-
-/* Off by default -- see the note in debug_print.h. */
-static bool input_logging_enabled;
-
-bool zmk_joycon2_debug_input_logging_enabled(void) { return input_logging_enabled; }
-
-void zmk_joycon2_debug_input_logging_toggle(void) {
-    if (input_logging_enabled) {
-        /* Announce before disabling, or the message would be suppressed by
-         * the very change it is reporting. */
-        zmk_joycon2_debug_print("JC2 BTNLOG OFF");
-        input_logging_enabled = false;
-        return;
-    }
-
-    input_logging_enabled = true;
-    zmk_joycon2_debug_print("JC2 BTNLOG ON");
-}

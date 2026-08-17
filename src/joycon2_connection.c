@@ -54,21 +54,6 @@ LOG_MODULE_REGISTER(joycon2_connection, CONFIG_ZMK_LOG_LEVEL);
 #define JOYCON2_HANDSHAKE_STEP_DELAY_MS 500
 #define JOYCON2_SUBSCRIBE_TO_HANDSHAKE_DELAY_MS 500
 
-static struct bt_conn *jc_conn;
-static bool jc_connecting;
-
-/* Which physical half we are talking to, taken from the advertisement (see
- * eir_parse_cb). The gamepad mapping depends on it. */
-static enum zmk_joycon2_side jc_side = ZMK_JOYCON2_SIDE_UNKNOWN;
-
-static struct bt_gatt_subscribe_params input_subscribe_params;
-static struct bt_gatt_subscribe_params response_subscribe_params;
-static struct bt_gatt_exchange_params mtu_exchange_params;
-
-static struct k_work_delayable scan_timeout_work;
-static struct k_work_delayable connect_timeout_work;
-static struct k_work_delayable handshake_work;
-
 /* Sequence and ordering match switch2-controllers-linux (the only known
  * working implementation at the raw-ATT level): subscribe RESPONSE ->
  * LED -> vibration preset -> feature-init -> feature-enable -> subscribe
@@ -93,7 +78,74 @@ enum handshake_step {
     HANDSHAKE_DONE,
 };
 
-static enum handshake_step handshake_step;
+/* Both halves can be connected at once, each with its own handshake,
+ * subscriptions and side, so all of that lives per controller rather than in
+ * file statics. Callbacks arrive keyed by bt_conn, subscribe_params or work
+ * item, so each is mapped back to its owner below. */
+#define JOYCON2_MAX_CONTROLLERS 2
+
+struct joycon2_ctrl {
+    struct bt_conn *conn;
+    bool connecting;
+    /* Which physical half this is, taken from the advertisement (see
+     * eir_parse_cb). The gamepad mapping depends on it. */
+    enum zmk_joycon2_side side;
+    enum handshake_step step;
+    struct bt_gatt_subscribe_params input_params;
+    struct bt_gatt_subscribe_params response_params;
+    struct bt_gatt_exchange_params mtu_params;
+    struct k_work_delayable handshake_work;
+    struct k_work_delayable connect_timeout_work;
+    /* Button-change detection for the debug log, per controller: one half's
+     * reports must not suppress the other's. */
+    bool have_last_buttons;
+    uint32_t last_buttons;
+};
+
+static struct joycon2_ctrl controllers[JOYCON2_MAX_CONTROLLERS];
+static bool scanning;
+
+static struct k_work_delayable scan_timeout_work;
+
+static struct joycon2_ctrl *ctrl_for_conn(struct bt_conn *conn) {
+    for (size_t i = 0; i < ARRAY_SIZE(controllers); i++) {
+        if (controllers[i].conn == conn) {
+            return &controllers[i];
+        }
+    }
+    return NULL;
+}
+
+static struct joycon2_ctrl *ctrl_free_slot(void) {
+    for (size_t i = 0; i < ARRAY_SIZE(controllers); i++) {
+        if (controllers[i].conn == NULL && !controllers[i].connecting) {
+            return &controllers[i];
+        }
+    }
+    return NULL;
+}
+
+static uint8_t ctrl_connected_count(void) {
+    uint8_t n = 0;
+    for (size_t i = 0; i < ARRAY_SIZE(controllers); i++) {
+        if (controllers[i].conn != NULL) {
+            n++;
+        }
+    }
+    return n;
+}
+
+static const char *side_tag(enum zmk_joycon2_side side) {
+    switch (side) {
+    case ZMK_JOYCON2_SIDE_LEFT:
+        return "L";
+    case ZMK_JOYCON2_SIDE_RIGHT:
+        return "R";
+    default:
+        return "?";
+    }
+}
+
 
 static void hex_encode_and_print(const char *prefix, const uint8_t *data, uint16_t length) {
     /* Sized so a full 63-byte input report (126 hex chars) plus prefix
@@ -226,10 +278,7 @@ static const struct joycon2_button joycon2_buttons[] = {
  * human-readable channel can sustain. Even then it is off unless input
  * logging is toggled on, since typing into the focused window makes the
  * gamepad unusable for actually playing anything. */
-static void decode_input_report(const uint8_t *data, uint16_t length) {
-    static bool have_last;
-    static uint32_t last_buttons;
-
+static void decode_input_report(struct joycon2_ctrl *c, const uint8_t *data, uint16_t length) {
     if (length < JOYCON2_REPORT_MIN_LEN) {
         return;
     }
@@ -239,7 +288,7 @@ static void decode_input_report(const uint8_t *data, uint16_t length) {
 #if IS_ENABLED(CONFIG_ZMK_JOYCON2_GAMEPAD)
     /* Runs for every report, not just on button change, so stick movement
      * is continuous; it does its own change detection and rate limiting. */
-    uint16_t stick_offset = (jc_side == ZMK_JOYCON2_SIDE_RIGHT)
+    uint16_t stick_offset = (c->side == ZMK_JOYCON2_SIDE_RIGHT)
                                 ? JOYCON2_REPORT_RIGHT_STICK_OFFSET
                                 : JOYCON2_REPORT_LEFT_STICK_OFFSET;
     if (length >= stick_offset + 3) {
@@ -247,22 +296,24 @@ static void decode_input_report(const uint8_t *data, uint16_t length) {
         const uint8_t *st = &data[stick_offset];
         uint16_t stick_x = st[0] | ((uint16_t)(st[1] & 0x0F) << 8);
         uint16_t stick_y = (st[1] >> 4) | ((uint16_t)st[2] << 4);
-        zmk_joycon2_gamepad_update(jc_side, buttons, stick_x, stick_y);
+        zmk_joycon2_gamepad_update(c->side, buttons, stick_x, stick_y);
     }
 #endif
 
-    if (have_last && buttons == last_buttons) {
+    if (c->have_last_buttons && buttons == c->last_buttons) {
         return;
     }
-    have_last = true;
-    last_buttons = buttons;
+    c->have_last_buttons = true;
+    c->last_buttons = buttons;
 
-    if (!zmk_joycon2_debug_input_logging_enabled()) {
+    /* Redundant for correctness -- debug_print gates the whole channel --
+     * but formatting a 128-byte string at 60-120Hz is not free. */
+    if (!zmk_joycon2_debug_logging_enabled()) {
         return;
     }
 
     char msg[128];
-    int n = snprintf(msg, sizeof(msg), "JC2 BTN");
+    int n = snprintf(msg, sizeof(msg), "JC2 BTN-%s", side_tag(c->side));
     if (buttons == 0) {
         n += snprintf(msg + n, sizeof(msg) - n, " --");
     } else {
@@ -283,9 +334,20 @@ static void decode_input_report(const uint8_t *data, uint16_t length) {
     zmk_joycon2_debug_print(msg);
 }
 
-static void start_handshake(void) {
-    handshake_step = HANDSHAKE_LED;
-    k_work_schedule(&handshake_work, K_MSEC(JOYCON2_HANDSHAKE_STEP_DELAY_MS));
+static void start_handshake(struct joycon2_ctrl *c) {
+    c->step = HANDSHAKE_LED;
+    k_work_schedule(&c->handshake_work, K_MSEC(JOYCON2_HANDSHAKE_STEP_DELAY_MS));
+}
+
+/* Notify and subscribe callbacks identify their controller by which of its
+ * two params structs was passed. */
+static struct joycon2_ctrl *ctrl_for_params(struct bt_gatt_subscribe_params *params) {
+    for (size_t i = 0; i < ARRAY_SIZE(controllers); i++) {
+        if (params == &controllers[i].input_params || params == &controllers[i].response_params) {
+            return &controllers[i];
+        }
+    }
+    return NULL;
 }
 
 static uint8_t input_notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_params *params,
@@ -298,7 +360,12 @@ static uint8_t input_notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_
         return BT_GATT_ITER_STOP;
     }
 
-    decode_input_report(data, length);
+    struct joycon2_ctrl *c = ctrl_for_params(params);
+    if (c == NULL) {
+        return BT_GATT_ITER_CONTINUE;
+    }
+
+    decode_input_report(c, data, length);
     return BT_GATT_ITER_CONTINUE;
 }
 
@@ -312,35 +379,37 @@ static uint8_t response_notify_func(struct bt_conn *conn, struct bt_gatt_subscri
         return BT_GATT_ITER_STOP;
     }
 
-    if (zmk_joycon2_debug_input_logging_enabled()) {
-        hex_encode_and_print("JC2 ACK", data, length);
-    }
+    hex_encode_and_print("JC2 ACK", data, length);
     return BT_GATT_ITER_CONTINUE;
 }
 
-static int jc_write_command(const uint8_t *data, size_t len) {
-    if (jc_conn == NULL) {
+static int jc_write_command(struct joycon2_ctrl *c, const uint8_t *data, size_t len) {
+    if (c->conn == NULL) {
         return -ENOTCONN;
     }
     /* sign=false: this controller flatly rejects standard BLE bonding (no
      * CSRK is ever established), unlike ZMK's own split link which is
      * bonded and can use signed writes. */
-    return bt_gatt_write_without_response(jc_conn, JOYCON2_COMMAND_VALUE_HANDLE, data, len, false);
+    return bt_gatt_write_without_response(c->conn, JOYCON2_COMMAND_VALUE_HANDLE, data, len, false);
 }
 
-static void subscribe_input(void);
+static void subscribe_input(struct joycon2_ctrl *c);
 
 static void handshake_work_handler(struct k_work *work) {
-    ARG_UNUSED(work);
-
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct joycon2_ctrl *c = CONTAINER_OF(dwork, struct joycon2_ctrl, handshake_work);
     int err;
 
-    switch (handshake_step) {
+    if (c->conn == NULL) {
+        return;
+    }
+
+    switch (c->step) {
     case HANDSHAKE_LED: {
         /* ledMask 0x01 = player-1 pattern. */
         static const uint8_t cmd[] = {0x09, 0x91, 0x01, 0x07, 0x00, 0x08, 0x00, 0x00,
                                        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-        err = jc_write_command(cmd, sizeof(cmd));
+        err = jc_write_command(c, cmd, sizeof(cmd));
         LOG_INF("joycon2: set player LED (%d)", err);
         break;
     }
@@ -348,7 +417,7 @@ static void handshake_work_handler(struct k_work *work) {
         /* "Play vibration preset 3" -- the connected/pairing buzz. */
         static const uint8_t cmd[] = {0x0A, 0x91, 0x01, 0x02, 0x00, 0x04,
                                        0x00, 0x00, 0x03, 0x00, 0x00, 0x00};
-        err = jc_write_command(cmd, sizeof(cmd));
+        err = jc_write_command(c, cmd, sizeof(cmd));
         LOG_INF("joycon2: pairing vibration (%d)", err);
         break;
     }
@@ -356,7 +425,7 @@ static void handshake_work_handler(struct k_work *work) {
         /* Feature-init, flags 0xFF = all features (0x0C/0x02). */
         static const uint8_t cmd[] = {0x0C, 0x91, 0x01, 0x02, 0x00, 0x04,
                                        0x00, 0x00, 0xFF, 0x00, 0x00, 0x00};
-        err = jc_write_command(cmd, sizeof(cmd));
+        err = jc_write_command(c, cmd, sizeof(cmd));
         LOG_INF("joycon2: feature init (%d)", err);
         break;
     }
@@ -364,15 +433,15 @@ static void handshake_work_handler(struct k_work *work) {
         /* Feature-enable, same flags (0x0C/0x04). */
         static const uint8_t cmd[] = {0x0C, 0x91, 0x01, 0x04, 0x00, 0x04,
                                        0x00, 0x00, 0xFF, 0x00, 0x00, 0x00};
-        err = jc_write_command(cmd, sizeof(cmd));
+        err = jc_write_command(c, cmd, sizeof(cmd));
         LOG_INF("joycon2: feature enable (%d)", err);
         break;
     }
     case HANDSHAKE_SUBSCRIBE_INPUT:
-        subscribe_input();
+        subscribe_input(c);
         zmk_joycon2_debug_print("JC2 HANDSHAKE SENT");
         if (!IS_ENABLED(CONFIG_ZMK_JOYCON2_BOND)) {
-            handshake_step = HANDSHAKE_DONE;
+            c->step = HANDSHAKE_DONE;
             return;
         }
         break;
@@ -392,7 +461,7 @@ static void handshake_work_handler(struct k_work *work) {
         if (count == 0) {
             LOG_ERR("joycon2: no local BT identity address");
             zmk_joycon2_debug_print("JC2 NO LOCAL BT ADDR");
-            handshake_step = HANDSHAKE_DONE;
+            c->step = HANDSHAKE_DONE;
             return;
         }
 
@@ -400,7 +469,7 @@ static void handshake_work_handler(struct k_work *work) {
         memcpy(&buf[10], addrs[0].a.val, 6);
         memcpy(&buf[16], addrs[0].a.val, 6);
 
-        err = jc_write_command(buf, sizeof(buf));
+        err = jc_write_command(c, buf, sizeof(buf));
         LOG_INF("joycon2: bond set-mac (%d)", err);
         break;
     }
@@ -411,7 +480,7 @@ static void handshake_work_handler(struct k_work *work) {
         static const uint8_t cmd[] = {0x15, 0x91, 0x01, 0x04, 0x00, 0x11, 0x00, 0x00, 0x00,
                                        0xEA, 0xBD, 0x47, 0x13, 0x89, 0x35, 0x42, 0xC6, 0x79,
                                        0xEE, 0x07, 0xF2, 0x53, 0x2C, 0x6C, 0x31};
-        err = jc_write_command(cmd, sizeof(cmd));
+        err = jc_write_command(c, cmd, sizeof(cmd));
         LOG_INF("joycon2: bond ltk1 (%d)", err);
         break;
     }
@@ -419,16 +488,16 @@ static void handshake_work_handler(struct k_work *work) {
         static const uint8_t cmd[] = {0x15, 0x91, 0x01, 0x02, 0x00, 0x11, 0x00, 0x00, 0x00,
                                        0x40, 0xB0, 0x8A, 0x5F, 0xCD, 0x1F, 0x9B, 0x41, 0x12,
                                        0x5C, 0xAC, 0xC6, 0x3F, 0x38, 0xA0, 0x73};
-        err = jc_write_command(cmd, sizeof(cmd));
+        err = jc_write_command(c, cmd, sizeof(cmd));
         LOG_INF("joycon2: bond ltk2 (%d)", err);
         break;
     }
     case HANDSHAKE_BOND_FINISH: {
         static const uint8_t cmd[] = {0x15, 0x91, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00};
-        err = jc_write_command(cmd, sizeof(cmd));
+        err = jc_write_command(c, cmd, sizeof(cmd));
         LOG_INF("joycon2: bond commit (%d)", err);
         zmk_joycon2_debug_print("JC2 BOND SENT");
-        handshake_step = HANDSHAKE_DONE;
+        c->step = HANDSHAKE_DONE;
         return;
     }
 #endif // IS_ENABLED(CONFIG_ZMK_JOYCON2_BOND)
@@ -437,8 +506,8 @@ static void handshake_work_handler(struct k_work *work) {
         return;
     }
 
-    handshake_step++;
-    k_work_schedule(&handshake_work, K_MSEC(JOYCON2_HANDSHAKE_STEP_DELAY_MS));
+    c->step++;
+    k_work_schedule(&c->handshake_work, K_MSEC(JOYCON2_HANDSHAKE_STEP_DELAY_MS));
 }
 
 /* struct bt_gatt_subscribe_params.subscribe reports the CCC WRITE's actual
@@ -450,44 +519,34 @@ static void handshake_work_handler(struct k_work *work) {
 static void subscribe_cb(struct bt_conn *conn, uint8_t err, struct bt_gatt_subscribe_params *params) {
     ARG_UNUSED(conn);
 
-    const char *name = "?";
-    if (params == &input_subscribe_params) {
-        name = "IN";
-    } else if (params == &response_subscribe_params) {
-        name = "RESP";
-    }
-
-    /* A failing CCC write is worth reporting even when quiet, since it
-     * means no data will ever arrive; a successful one is just noise. */
-    if (err == 0 && !zmk_joycon2_debug_input_logging_enabled()) {
-        return;
-    }
+    struct joycon2_ctrl *c = ctrl_for_params(params);
+    const char *name = (c != NULL && params == &c->input_params) ? "IN" : "RESP";
 
     char msg[48];
-    snprintf(msg, sizeof(msg), "JC2 CCC %s err=%u", name, err);
+    snprintf(msg, sizeof(msg), "JC2 CCC-%s %s err=%u", side_tag(c ? c->side : 0), name, err);
     zmk_joycon2_debug_print(msg);
 }
 
 /* Deliberately called LAST, after feature-enable, matching the working
  * Linux implementation's ordering -- see the handshake_step comment. */
-static void subscribe_input(void) {
-    if (!jc_conn) {
+static void subscribe_input(struct joycon2_ctrl *c) {
+    if (c->conn == NULL) {
         return;
     }
 
-    input_subscribe_params.value_handle = JOYCON2_INPUT_VALUE_HANDLE;
-    input_subscribe_params.ccc_handle = JOYCON2_INPUT_CCC_HANDLE;
-    input_subscribe_params.notify = input_notify_func;
-    input_subscribe_params.subscribe = subscribe_cb;
-    input_subscribe_params.value = BT_GATT_CCC_NOTIFY;
-    int err = bt_gatt_subscribe(jc_conn, &input_subscribe_params);
+    c->input_params.value_handle = JOYCON2_INPUT_VALUE_HANDLE;
+    c->input_params.ccc_handle = JOYCON2_INPUT_CCC_HANDLE;
+    c->input_params.notify = input_notify_func;
+    c->input_params.subscribe = subscribe_cb;
+    c->input_params.value = BT_GATT_CCC_NOTIFY;
+    int err = bt_gatt_subscribe(c->conn, &c->input_params);
     if (err && err != -EALREADY) {
         LOG_ERR("joycon2: input subscribe failed (%d)", err);
         zmk_joycon2_debug_print("JC2 INPUT SUBSCRIBE FAILED");
     }
 }
 
-static void start_subscriptions(struct bt_conn *conn) {
+static void start_subscriptions(struct joycon2_ctrl *c) {
     /* Explicit ccc_handle (rather than .disc_params) skips CCC
      * auto-discovery entirely -- that path also uses a READ_BY_TYPE-style
      * op internally and would likely hit the same wall as characteristic
@@ -495,28 +554,31 @@ static void start_subscriptions(struct bt_conn *conn) {
      * as the handshake's final step. */
     int err;
 
-    response_subscribe_params.value_handle = JOYCON2_RESPONSE_VALUE_HANDLE;
-    response_subscribe_params.ccc_handle = JOYCON2_RESPONSE_CCC_HANDLE;
-    response_subscribe_params.notify = response_notify_func;
-    response_subscribe_params.subscribe = subscribe_cb;
-    response_subscribe_params.value = BT_GATT_CCC_NOTIFY;
-    err = bt_gatt_subscribe(conn, &response_subscribe_params);
+    c->response_params.value_handle = JOYCON2_RESPONSE_VALUE_HANDLE;
+    c->response_params.ccc_handle = JOYCON2_RESPONSE_CCC_HANDLE;
+    c->response_params.notify = response_notify_func;
+    c->response_params.subscribe = subscribe_cb;
+    c->response_params.value = BT_GATT_CCC_NOTIFY;
+    err = bt_gatt_subscribe(c->conn, &c->response_params);
     if (err && err != -EALREADY) {
         LOG_ERR("joycon2: response subscribe failed (%d)", err);
         zmk_joycon2_debug_print("JC2 RESPONSE SUBSCRIBE FAILED");
     }
 
-    if (zmk_joycon2_debug_input_logging_enabled()) {
-        zmk_joycon2_debug_print("JC2 SUBSCRIBED");
-    }
-    /* start_handshake resets handshake_step -- without it a reconnect
-     * would find the step still at HANDSHAKE_DONE and never handshake. */
-    start_handshake();
+    zmk_joycon2_debug_print("JC2 SUBSCRIBED");
+    /* start_handshake resets the step -- without it a reconnect would find
+     * it still at HANDSHAKE_DONE and never handshake. */
+    start_handshake(c);
 }
 
 static void mtu_exchange_cb(struct bt_conn *conn, uint8_t err,
                              struct bt_gatt_exchange_params *params) {
     ARG_UNUSED(params);
+
+    struct joycon2_ctrl *c = ctrl_for_conn(conn);
+    if (c == NULL) {
+        return;
+    }
 
     /* JoyConDecoder (the reference driver) needs a report of at least 62
      * bytes to hold buttons+sticks+motion+battery -- if the negotiated ATT
@@ -532,25 +594,47 @@ static void mtu_exchange_cb(struct bt_conn *conn, uint8_t err,
     } else {
         uint16_t mtu = bt_gatt_get_mtu(conn);
         LOG_INF("joycon2: MTU exchange succeeded, ATT MTU=%u", mtu);
-        /* An MTU below 66 cannot carry a 63-byte input report, so it is
-         * worth shouting about regardless of the quiet setting. */
-        if (mtu < 66 || zmk_joycon2_debug_input_logging_enabled()) {
-            snprintf(msg, sizeof(msg), "JC2 MTU=%u", mtu);
-            zmk_joycon2_debug_print(msg);
-        }
+        /* An MTU below 66 cannot carry a 63-byte input report at all. */
+        snprintf(msg, sizeof(msg), "JC2 MTU=%u", mtu);
+        zmk_joycon2_debug_print(msg);
     }
 
-    start_subscriptions(conn);
+    start_subscriptions(c);
+}
+
+static void scan_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
+                        struct net_buf_simple *ad);
+
+/* Restart the scan when a slot is still free, so one combo press can pick up
+ * both halves as they are synced in turn. */
+static void resume_scan_if_slot_free(void) {
+    if (scanning || ctrl_free_slot() == NULL) {
+        return;
+    }
+
+    int err = bt_le_scan_start(BT_LE_SCAN_PASSIVE, scan_found);
+    if (err) {
+        LOG_WRN("joycon2: scan resume failed (%d)", err);
+        return;
+    }
+
+    scanning = true;
+    k_work_schedule(&scan_timeout_work, K_SECONDS(JOYCON2_SCAN_TIMEOUT_SEC));
 }
 
 static void scan_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
                         struct net_buf_simple *ad) {
     ARG_UNUSED(rssi);
 
-    if (!jc_connecting || jc_conn != NULL) {
+    if (!scanning) {
         return;
     }
     if (type != BT_GAP_ADV_TYPE_ADV_IND) {
+        return;
+    }
+
+    struct joycon2_ctrl *c = ctrl_free_slot();
+    if (c == NULL) {
         return;
     }
 
@@ -576,16 +660,12 @@ static void scan_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
             count > 0 && memcmp(ctx.bond_addr, self[0].a.val, JOYCON2_AD_BOND_ADDR_LEN) == 0;
 
         if (!pairing_mode && !bonded_to_us) {
-            if (zmk_joycon2_debug_input_logging_enabled()) {
-                hex_encode_and_print("JC2 SKIP BONDED", ctx.bond_addr, sizeof(ctx.bond_addr));
-            }
+            hex_encode_and_print("JC2 SKIP BONDED", ctx.bond_addr, sizeof(ctx.bond_addr));
             return;
         }
 
         zmk_joycon2_debug_print(pairing_mode ? "JC2 PAIRMODE" : "JC2 REMEMBERS US");
     }
-
-    jc_side = ctx.side;
 
     struct bt_conn *existing = bt_conn_lookup_addr_le(BT_ID_DEFAULT, addr);
     if (existing != NULL) {
@@ -597,17 +677,24 @@ static void scan_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
     bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
     LOG_INF("joycon2: found %s, connecting", addr_str);
 
+    /* One connection can be set up at a time: bt_conn_le_create needs the
+     * initiator, which the scanner is using. Scanning resumes from
+     * jc_connected if a slot is still free. */
     bt_le_scan_stop();
+    scanning = false;
     k_work_cancel_delayable(&scan_timeout_work);
+
+    c->side = ctx.side;
+    c->connecting = true;
 
     /* 7.5-15ms: fast enough for a 120Hz+ input stream. The previous
      * 30-50ms request may have been too slow for the device to bother
      * streaming (matches Android's initial 7.5ms connection). */
     struct bt_le_conn_param *param = BT_LE_CONN_PARAM(0x0006, 0x000C, 0, 400);
-    int err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN, param, &jc_conn);
+    int err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN, param, &c->conn);
     if (err) {
         LOG_ERR("joycon2: create conn failed (%d)", err);
-        jc_connecting = false;
+        c->connecting = false;
         zmk_joycon2_debug_print("JC2 CREATE CONN FAILED");
         return;
     }
@@ -617,101 +704,115 @@ static void scan_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
      * bt_conn_le_create()'s default create params use -- if neither
      * jc_connected nor jc_disconnected ever fires, this guarantees we
      * eventually report *something* instead of hanging silently. */
-    k_work_schedule(&connect_timeout_work, K_SECONDS(JOYCON2_CONNECT_TIMEOUT_SEC));
+    k_work_schedule(&c->connect_timeout_work, K_SECONDS(JOYCON2_CONNECT_TIMEOUT_SEC));
 }
 
 static void scan_timeout_work_handler(struct k_work *work) {
     ARG_UNUSED(work);
 
-    if (!jc_connecting || jc_conn != NULL) {
+    if (!scanning) {
         return;
     }
 
     bt_le_scan_stop();
-    zmk_joycon2_debug_print("JC2 SCAN TIMEOUT NOT FOUND");
-    jc_connecting = false;
+    scanning = false;
+    /* Not an error when one controller is already connected: the scan was
+     * just waiting to see whether a second would turn up. */
+    zmk_joycon2_debug_print(ctrl_connected_count() > 0 ? "JC2 SCAN DONE"
+                                                       : "JC2 SCAN TIMEOUT NOT FOUND");
 }
 
 static void connect_timeout_work_handler(struct k_work *work) {
-    ARG_UNUSED(work);
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct joycon2_ctrl *c = CONTAINER_OF(dwork, struct joycon2_ctrl, connect_timeout_work);
 
-    if (jc_conn == NULL) {
+    if (c->conn == NULL) {
         return;
     }
 
     LOG_ERR("joycon2: connect attempt timed out");
-    bt_conn_disconnect(jc_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-    bt_conn_unref(jc_conn);
-    jc_conn = NULL;
-    jc_connecting = false;
+    bt_conn_disconnect(c->conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+    bt_conn_unref(c->conn);
+    c->conn = NULL;
+    c->connecting = false;
     zmk_joycon2_debug_print("JC2 CONNECT TIMEOUT");
 }
 
 static void jc_connected(struct bt_conn *conn, uint8_t err) {
-    if (conn != jc_conn) {
+    struct joycon2_ctrl *c = ctrl_for_conn(conn);
+    if (c == NULL) {
+        /* Not one of ours -- the host link or the other keyboard half. */
         return;
     }
 
-    k_work_cancel_delayable(&connect_timeout_work);
+    k_work_cancel_delayable(&c->connect_timeout_work);
+    c->connecting = false;
 
     if (err) {
         LOG_ERR("joycon2: connect failed (err %d)", err);
-        bt_conn_unref(jc_conn);
-        jc_conn = NULL;
-        jc_connecting = false;
+        bt_conn_unref(c->conn);
+        c->conn = NULL;
         zmk_joycon2_debug_print("JC2 CONNECT FAILED");
+        resume_scan_if_slot_free();
         return;
     }
 
     LOG_INF("joycon2: connected, subscribing");
-    zmk_joycon2_debug_print(jc_side == ZMK_JOYCON2_SIDE_LEFT    ? "JC2 CONNECTED L"
-                            : jc_side == ZMK_JOYCON2_SIDE_RIGHT ? "JC2 CONNECTED R"
-                                                                : "JC2 CONNECTED ?");
+    char msg[32];
+    snprintf(msg, sizeof(msg), "JC2 CONNECTED %s", side_tag(c->side));
+    zmk_joycon2_debug_print(msg);
+
 #if IS_ENABLED(CONFIG_ZMK_JOYCON2_GAMEPAD)
-    /* Only one controller is supported so far, so this is always SOLO --
-     * wired up now so adding the second connection selects DUO on its own. */
-    zmk_joycon2_gamepad_set_connected_count(1);
+    /* One controller selects the solo mapping, two the duo mapping. */
+    zmk_joycon2_gamepad_set_connected_count(ctrl_connected_count());
 #endif
-    jc_connecting = false;
+
+    /* Keep looking for the other half while this one finishes its
+     * handshake, so a single combo press can pick up both. */
+    resume_scan_if_slot_free();
 
     /* Not required before subscribing works, but the default 23-byte ATT
      * MTU would truncate longer input-report notifications later, and no
      * known-working client against this device skips it. Subscriptions
      * start from mtu_exchange_cb once this actually completes. */
-    mtu_exchange_params.func = mtu_exchange_cb;
-    int mtu_err = bt_gatt_exchange_mtu(conn, &mtu_exchange_params);
+    c->mtu_params.func = mtu_exchange_cb;
+    int mtu_err = bt_gatt_exchange_mtu(conn, &c->mtu_params);
     if (mtu_err) {
         LOG_ERR("joycon2: MTU exchange request failed (%d)", mtu_err);
         /* No callback will ever fire in this case -- proceed directly. */
-        start_subscriptions(conn);
+        start_subscriptions(c);
     }
 }
 
 static void jc_disconnected(struct bt_conn *conn, uint8_t reason) {
-    if (conn != jc_conn) {
+    struct joycon2_ctrl *c = ctrl_for_conn(conn);
+    if (c == NULL) {
         return;
     }
 
     LOG_INF("joycon2: disconnected (reason %d)", reason);
-    k_work_cancel_delayable(&connect_timeout_work);
-    k_work_cancel_delayable(&handshake_work);
-    bt_conn_unref(jc_conn);
-    jc_conn = NULL;
-    jc_connecting = false;
+    k_work_cancel_delayable(&c->connect_timeout_work);
+    k_work_cancel_delayable(&c->handshake_work);
+    bt_conn_unref(c->conn);
+    c->conn = NULL;
+    c->connecting = false;
+    c->step = HANDSHAKE_DONE;
+    c->have_last_buttons = false;
 
     char msg[48];
-#if IS_ENABLED(CONFIG_ZMK_JOYCON2_GAMEPAD)
-    zmk_joycon2_gamepad_set_connected_count(0);
-#endif
-    jc_side = ZMK_JOYCON2_SIDE_UNKNOWN;
+    snprintf(msg, sizeof(msg), "JC2 DISCONNECTED %s reason=0x%02x", side_tag(c->side), reason);
+    c->side = ZMK_JOYCON2_SIDE_UNKNOWN;
 
-    snprintf(msg, sizeof(msg), "JC2 DISCONNECTED reason=0x%02x", reason);
+#if IS_ENABLED(CONFIG_ZMK_JOYCON2_GAMEPAD)
+    zmk_joycon2_gamepad_set_connected_count(ctrl_connected_count());
+#endif
+
     zmk_joycon2_debug_print(msg);
 }
 
 static void jc_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_t latency,
                                  uint16_t timeout) {
-    if (conn != jc_conn) {
+    if (ctrl_for_conn(conn) == NULL) {
         return;
     }
 
@@ -727,7 +828,7 @@ static void jc_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_
 
 #if defined(CONFIG_BT_USER_DATA_LEN_UPDATE)
 static void jc_le_data_len_updated(struct bt_conn *conn, struct bt_conn_le_data_len_info *info) {
-    if (conn != jc_conn) {
+    if (ctrl_for_conn(conn) == NULL) {
         return;
     }
 
@@ -736,10 +837,6 @@ static void jc_le_data_len_updated(struct bt_conn *conn, struct bt_conn_le_data_
      * 27 = no DLE, 251 = full). A 62-byte input report needs 70 bytes
      * on-air, and the hypothesis is Nintendo's input hot path refuses
      * to fragment across 27-byte PDUs. */
-    if (!zmk_joycon2_debug_input_logging_enabled()) {
-        return;
-    }
-
     char msg[48];
     snprintf(msg, sizeof(msg), "JC2 DLE tx=%u rx=%u", info->tx_max_len, info->rx_max_len);
     zmk_joycon2_debug_print(msg);
@@ -756,17 +853,17 @@ static struct bt_conn_cb jc_conn_callbacks = {
 };
 
 int zmk_joycon2_connection_start(void) {
-    if (jc_connecting) {
+    if (scanning) {
         return -EBUSY;
     }
 
-    if (jc_conn != NULL) {
-        bt_conn_disconnect(jc_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-        bt_conn_unref(jc_conn);
-        jc_conn = NULL;
+    /* Deliberately keeps whatever is already connected: pressing the combo
+     * again is how a second half gets added, so tearing down the first would
+     * defeat the point. */
+    if (ctrl_free_slot() == NULL) {
+        zmk_joycon2_debug_print("JC2 BOTH CONNECTED");
+        return -ENOSPC;
     }
-
-    jc_connecting = true;
 
     /* Immediate feedback that the combo registered at all, decoupled from
      * whatever the scan eventually finds (which can take up to
@@ -781,19 +878,22 @@ int zmk_joycon2_connection_start(void) {
     int err = bt_le_scan_start(BT_LE_SCAN_PASSIVE, scan_found);
     if (err) {
         LOG_ERR("joycon2: scan start failed (%d)", err);
-        jc_connecting = false;
         zmk_joycon2_debug_print("JC2 SCAN START FAILED");
         return err;
     }
 
+    scanning = true;
     k_work_schedule(&scan_timeout_work, K_SECONDS(JOYCON2_SCAN_TIMEOUT_SEC));
     return 0;
 }
 
 static int joycon2_connection_init(void) {
     k_work_init_delayable(&scan_timeout_work, scan_timeout_work_handler);
-    k_work_init_delayable(&connect_timeout_work, connect_timeout_work_handler);
-    k_work_init_delayable(&handshake_work, handshake_work_handler);
+    for (size_t i = 0; i < ARRAY_SIZE(controllers); i++) {
+        controllers[i].step = HANDSHAKE_DONE;
+        k_work_init_delayable(&controllers[i].handshake_work, handshake_work_handler);
+        k_work_init_delayable(&controllers[i].connect_timeout_work, connect_timeout_work_handler);
+    }
     bt_conn_cb_register(&jc_conn_callbacks);
     return 0;
 }

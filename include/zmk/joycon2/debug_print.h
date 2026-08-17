@@ -16,17 +16,15 @@
 int zmk_joycon2_debug_print(const char *str);
 
 /**
- * Per-input-report logging (button state changes) is OFF by default,
- * because this channel types into whatever field has focus on the host --
- * with it on, playing a game or using a gamepad tester is impossible since
- * every press also types text. Connection-lifecycle messages are
- * unaffected: they fire a handful of times per connection, not per input
- * report.
+ * All output through this channel is OFF by default, because it types into
+ * whatever field has focus on the host: with it on, a gamepad tester or any
+ * game is unusable, since every press also types text. Nothing prints --
+ * not connection progress, not failures -- until it is switched on.
  *
- * Toggled at runtime so switching between "testing the gamepad" and
- * "debugging the decoder" doesn't need a reflash.
+ * Toggled at runtime so switching between "using the gamepad" and
+ * "debugging" never needs a reflash.
  */
-bool zmk_joycon2_debug_input_logging_enabled(void);
+bool zmk_joycon2_debug_logging_enabled(void);
 
-/** Flips input logging and reports the new state through the same channel. */
-void zmk_joycon2_debug_input_logging_toggle(void);
+/** Flips logging and announces the new state, which always prints. */
+void zmk_joycon2_debug_logging_toggle(void);

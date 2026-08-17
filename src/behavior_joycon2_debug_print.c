@@ -37,7 +37,7 @@ static int on_keymap_binding_pressed(struct zmk_behavior_binding *binding,
 
     switch (binding->param1) {
     case JOYCON2_DEBUG_ACTION_TOGGLE_INPUT_LOG:
-        zmk_joycon2_debug_input_logging_toggle();
+        zmk_joycon2_debug_logging_toggle();
         return 0;
     case JOYCON2_DEBUG_ACTION_SELF_TEST:
         return zmk_joycon2_debug_print("JOYCON2 DEBUG PRINT OK 12345");

@@ -17,6 +17,7 @@
  */
 
 #include <stdlib.h>
+#include <string.h>
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -235,6 +236,7 @@ void zmk_joycon2_gamepad_set_connected_count(uint8_t count) {
     /* Release everything so a button held under the old mapping can't
      * stay stuck down at a HID index the new mapping never touches. */
     zmk_hid_gamepad_clear();
+    memset(side_state, 0, sizeof(side_state));
     ZMK_JOYCON2_SEND_GAMEPAD_REPORT();
 }
 
@@ -266,26 +268,33 @@ static int8_t scale_axis(uint16_t raw) {
     return (int8_t)CLAMP((centred * 127) / span, -127, 127);
 }
 
+/* Per-side, because in duo both halves report independently: sharing this
+ * would make each half's report suppress the other's. */
+struct joycon2_side_state {
+    bool have_last;
+    uint32_t last_buttons;
+    int8_t last_x;
+    int8_t last_y;
+};
+
+static struct joycon2_side_state side_state[2];
+
 void zmk_joycon2_gamepad_update(enum zmk_joycon2_side side, uint32_t buttons, uint16_t stick_x_raw,
                                  uint16_t stick_y_raw) {
-    static bool have_last;
-    static uint32_t last_buttons;
-    static int8_t last_x;
-    static int8_t last_y;
-
+    struct joycon2_side_state *st = &side_state[side == ZMK_JOYCON2_SIDE_RIGHT ? 1 : 0];
     const struct joycon2_profile_map *map = map_for(side);
 
     int8_t x = scale_axis(stick_x_raw);
     /* HID Y grows downwards, the stick's raw Y grows upwards. */
     int8_t y = -scale_axis(stick_y_raw);
 
-    bool buttons_changed = !have_last || buttons != last_buttons;
-    bool axes_changed = !have_last || abs(x - last_x) >= JOYCON2_AXIS_CHANGE_THRESHOLD ||
-                        abs(y - last_y) >= JOYCON2_AXIS_CHANGE_THRESHOLD ||
+    bool buttons_changed = !st->have_last || buttons != st->last_buttons;
+    bool axes_changed = !st->have_last || abs(x - st->last_x) >= JOYCON2_AXIS_CHANGE_THRESHOLD ||
+                        abs(y - st->last_y) >= JOYCON2_AXIS_CHANGE_THRESHOLD ||
                         /* Always report a return to exact centre, however
                          * small the final step, so the stick can't stick
                          * just shy of neutral. */
-                        ((x == 0 || y == 0) && (last_x != x || last_y != y));
+                        ((x == 0 || y == 0) && (st->last_x != x || st->last_y != y));
 
     if (!buttons_changed && !axes_changed) {
         return;
@@ -298,7 +307,7 @@ void zmk_joycon2_gamepad_update(enum zmk_joycon2_side side, uint32_t buttons, ui
                 continue;
             }
             bool now_pressed = (buttons & mask) != 0;
-            bool was_pressed = have_last && (last_buttons & mask) != 0;
+            bool was_pressed = st->have_last && (st->last_buttons & mask) != 0;
             if (now_pressed == was_pressed) {
                 continue;
             }
@@ -319,10 +328,10 @@ void zmk_joycon2_gamepad_update(enum zmk_joycon2_side side, uint32_t buttons, ui
         zmk_hid_gamepad_left_stick_set(x, y);
     }
 
-    have_last = true;
-    last_buttons = buttons;
-    last_x = x;
-    last_y = y;
+    st->have_last = true;
+    st->last_buttons = buttons;
+    st->last_x = x;
+    st->last_y = y;
 
     int err = ZMK_JOYCON2_SEND_GAMEPAD_REPORT();
     if (err) {
