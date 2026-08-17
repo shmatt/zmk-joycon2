@@ -1,4 +1,7 @@
-if(CONFIG_ZMK_JOYCON2)
+# HID report generation (src/hid.c) only exists on the central side of a
+# split build (or on non-split boards) — mirror ZMK's own app/CMakeLists.txt
+# guard so this doesn't try to link against zmk_hid_* on a peripheral image.
+if(CONFIG_ZMK_JOYCON2 AND ((NOT CONFIG_ZMK_SPLIT) OR CONFIG_ZMK_SPLIT_ROLE_CENTRAL))
   zephyr_library()
   zephyr_library_include_directories(include)
   # ZMK's own app/include (zmk/hid.h, drivers/behavior.h, etc.) is private to
