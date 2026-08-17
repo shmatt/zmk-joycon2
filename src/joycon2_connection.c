@@ -21,6 +21,7 @@
 #include <zephyr/bluetooth/hci.h>
 
 #include <zmk/joycon2/connection.h>
+#include <zmk/joycon2/gamepad.h>
 #include <zmk/joycon2/debug_print.h>
 
 LOG_MODULE_REGISTER(joycon2_connection, CONFIG_ZMK_LOG_LEVEL);
@@ -55,6 +56,10 @@ LOG_MODULE_REGISTER(joycon2_connection, CONFIG_ZMK_LOG_LEVEL);
 
 static struct bt_conn *jc_conn;
 static bool jc_connecting;
+
+/* Which physical half we are talking to, taken from the advertisement (see
+ * eir_parse_cb). The gamepad mapping depends on it. */
+static enum zmk_joycon2_side jc_side = ZMK_JOYCON2_SIDE_UNKNOWN;
 
 static struct bt_gatt_subscribe_params input_subscribe_params;
 static struct bt_gatt_subscribe_params response_subscribe_params;
@@ -104,7 +109,15 @@ static void hex_encode_and_print(const char *prefix, const uint8_t *data, uint16
 
 struct eir_parse_ctx {
     bool found;
+    enum zmk_joycon2_side side;
 };
+
+/* Byte 5 of the manufacturer payload (after the 2-byte company ID)
+ * identifies the half; values cross-checked against JoyConPlusPlus and
+ * against both of our own units. */
+#define JOYCON2_AD_SIDE_OFFSET 5
+#define JOYCON2_AD_SIDE_RIGHT 0x66
+#define JOYCON2_AD_SIDE_LEFT 0x67
 
 static bool eir_parse_cb(struct bt_data *data, void *user_data) {
     struct eir_parse_ctx *ctx = user_data;
@@ -117,11 +130,27 @@ static bool eir_parse_cb(struct bt_data *data, void *user_data) {
     }
 
     uint16_t company_id = sys_get_le16(data->data);
-    if (company_id == JOYCON2_NINTENDO_COMPANY_ID) {
-        ctx->found = true;
-        return false;
+    if (company_id != JOYCON2_NINTENDO_COMPANY_ID) {
+        return true;
     }
-    return true;
+
+    ctx->found = true;
+
+    const uint8_t *mfg = &data->data[2];
+    uint8_t mfg_len = data->data_len - 2;
+    if (mfg_len > JOYCON2_AD_SIDE_OFFSET) {
+        switch (mfg[JOYCON2_AD_SIDE_OFFSET]) {
+        case JOYCON2_AD_SIDE_LEFT:
+            ctx->side = ZMK_JOYCON2_SIDE_LEFT;
+            break;
+        case JOYCON2_AD_SIDE_RIGHT:
+            ctx->side = ZMK_JOYCON2_SIDE_RIGHT;
+            break;
+        default:
+            break;
+        }
+    }
+    return false;
 }
 
 /* Input report layout, confirmed byte-for-byte against real captures from
@@ -134,6 +163,7 @@ static bool eir_parse_cb(struct bt_data *data, void *user_data) {
 #define JOYCON2_REPORT_MIN_LEN 8
 #define JOYCON2_REPORT_BUTTONS_OFFSET 4
 #define JOYCON2_REPORT_BATTERY_OFFSET 0x1F
+#define JOYCON2_REPORT_LEFT_STICK_OFFSET 10
 
 /* The top three bits of the button word are always set on this hardware
  * (some always-on status flags, not buttons) -- mask to the documented
@@ -172,6 +202,18 @@ static void decode_input_report(const uint8_t *data, uint16_t length) {
     }
 
     uint32_t buttons = sys_get_le32(&data[JOYCON2_REPORT_BUTTONS_OFFSET]) & JOYCON2_BUTTON_MASK;
+
+#if IS_ENABLED(CONFIG_ZMK_JOYCON2_GAMEPAD)
+    /* Runs for every report, not just on button change, so stick movement
+     * is continuous; it does its own change detection and rate limiting. */
+    if (length >= JOYCON2_REPORT_LEFT_STICK_OFFSET + 3) {
+        const uint8_t *s = &data[JOYCON2_REPORT_LEFT_STICK_OFFSET];
+        uint16_t stick_x = s[0] | ((uint16_t)(s[1] & 0x0F) << 8);
+        uint16_t stick_y = (s[1] >> 4) | ((uint16_t)s[2] << 4);
+        zmk_joycon2_gamepad_update(jc_side, buttons, stick_x, stick_y);
+    }
+#endif
+
     if (have_last && buttons == last_buttons) {
         return;
     }
@@ -396,11 +438,12 @@ static void scan_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
         return;
     }
 
-    struct eir_parse_ctx ctx = {.found = false};
+    struct eir_parse_ctx ctx = {.found = false, .side = ZMK_JOYCON2_SIDE_UNKNOWN};
     bt_data_parse(ad, eir_parse_cb, &ctx);
     if (!ctx.found) {
         return;
     }
+    jc_side = ctx.side;
 
     struct bt_conn *existing = bt_conn_lookup_addr_le(BT_ID_DEFAULT, addr);
     if (existing != NULL) {
@@ -479,7 +522,14 @@ static void jc_connected(struct bt_conn *conn, uint8_t err) {
     }
 
     LOG_INF("joycon2: connected, subscribing");
-    zmk_joycon2_debug_print("JC2 CONNECTED");
+    zmk_joycon2_debug_print(jc_side == ZMK_JOYCON2_SIDE_LEFT    ? "JC2 CONNECTED L"
+                            : jc_side == ZMK_JOYCON2_SIDE_RIGHT ? "JC2 CONNECTED R"
+                                                                : "JC2 CONNECTED ?");
+#if IS_ENABLED(CONFIG_ZMK_JOYCON2_GAMEPAD)
+    /* Only one controller is supported so far, so this is always SOLO --
+     * wired up now so adding the second connection selects DUO on its own. */
+    zmk_joycon2_gamepad_set_connected_count(1);
+#endif
     jc_connecting = false;
 
     /* Not required before subscribing works, but the default 23-byte ATT
@@ -508,6 +558,11 @@ static void jc_disconnected(struct bt_conn *conn, uint8_t reason) {
     jc_connecting = false;
 
     char msg[48];
+#if IS_ENABLED(CONFIG_ZMK_JOYCON2_GAMEPAD)
+    zmk_joycon2_gamepad_set_connected_count(0);
+#endif
+    jc_side = ZMK_JOYCON2_SIDE_UNKNOWN;
+
     snprintf(msg, sizeof(msg), "JC2 DISCONNECTED reason=0x%02x", reason);
     zmk_joycon2_debug_print(msg);
 }

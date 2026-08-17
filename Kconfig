@@ -18,4 +18,15 @@ config ZMK_JOYCON2_CONNECT
     depends on ZMK_JOYCON2_DEBUG_PRINT
     default y
 
+config ZMK_JOYCON2_GAMEPAD
+    bool "Expose decoded Joy-Con 2 input to the host as a gamepad"
+    depends on ZMK_JOYCON2_CONNECT
+    # ZMK's own HID report descriptor is a static const array in its app
+    # headers and cannot be extended from an out-of-tree module, so the
+    # gamepad interface itself comes from zmk-hid-io, which registers a
+    # second HID-over-GATT service. Add that module to the build alongside
+    # this one (ZMK_EXTRA_MODULES / the workflow's `modules` input).
+    depends on ZMK_HID_IO_JOYSTICK
+    default y
+
 endif # ZMK_JOYCON2
