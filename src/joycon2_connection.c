@@ -100,7 +100,9 @@ enum handshake_step {
 static enum handshake_step handshake_step;
 
 static void hex_encode_and_print(const char *prefix, const uint8_t *data, uint16_t length) {
-    char msg[128];
+    /* Sized so a full 63-byte input report (126 hex chars) plus prefix
+     * fits without truncation; debug_print's own buffer is 256. */
+    char msg[160];
     int n = snprintf(msg, sizeof(msg), "%s ", prefix);
     for (uint16_t i = 0; i < length && n >= 0 && (size_t)n < sizeof(msg) - 3; i++) {
         n += snprintf(msg + n, sizeof(msg) - n, "%02X", data[i]);
@@ -153,7 +155,16 @@ static uint8_t input_notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_
         return BT_GATT_ITER_STOP;
     }
 
-    hex_encode_and_print("JC2 IN", data, length);
+    /* Input reports may stream at 120Hz+; the HID-typing debug channel
+     * types a few chars per report period at best, so print only the
+     * first few packets and then a sparse heartbeat with the count. */
+    static uint32_t input_count;
+    input_count++;
+    if (input_count <= 5 || (input_count % 256) == 0) {
+        char prefix[24];
+        snprintf(prefix, sizeof(prefix), "JC2 IN #%u", (unsigned)input_count);
+        hex_encode_and_print(prefix, data, length);
+    }
     return BT_GATT_ITER_CONTINUE;
 }
 
@@ -187,6 +198,78 @@ JOYCON2_ALT_NOTIFY_FUNC(alt1_notify_func, "JC2 ALT1")
 JOYCON2_ALT_NOTIFY_FUNC(alt2_notify_func, "JC2 ALT2")
 JOYCON2_ALT_NOTIFY_FUNC(alt3_notify_func, "JC2 ALT3")
 JOYCON2_ALT_NOTIFY_FUNC(alt4_notify_func, "JC2 ALT4")
+
+/* Catch-all notification sniffer.
+ *
+ * Five of the service's characteristics carry the Notify property but no
+ * CCC descriptor (per the nRF Connect service dump). A hand-rolled GATT
+ * server can send notifications on such handles unconditionally -- and
+ * both Android (setCharacteristicNotification local filter) and Zephyr
+ * (bt_gatt_notification drops handles with no matching subscription)
+ * would silently discard them. So the input stream may already be
+ * flowing on a handle nobody has ever listened to.
+ *
+ * bt_gatt_resubscribe() registers a local subscription entry WITHOUT
+ * writing any CCC (no on-air traffic), so covering every handle in the
+ * service is free and makes any notification from any handle visible.
+ */
+#define JOYCON2_SNIFF_FIRST_HANDLE 0x0001
+#define JOYCON2_SNIFF_LAST_HANDLE 0x0030
+#define JOYCON2_SNIFF_COUNT (JOYCON2_SNIFF_LAST_HANDLE - JOYCON2_SNIFF_FIRST_HANDLE + 1)
+
+static struct bt_gatt_subscribe_params sniff_params[JOYCON2_SNIFF_COUNT];
+static uint32_t sniff_counts[JOYCON2_SNIFF_COUNT];
+
+static uint8_t sniff_notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_params *params,
+                                  const void *data, uint16_t length) {
+    ARG_UNUSED(conn);
+
+    if (!data) {
+        return BT_GATT_ITER_STOP;
+    }
+
+    uint16_t idx = params->value_handle - JOYCON2_SNIFF_FIRST_HANDLE;
+    uint32_t count = ++sniff_counts[idx];
+    if (count <= 3 || (count % 256) == 0) {
+        char prefix[32];
+        snprintf(prefix, sizeof(prefix), "JC2 N%04X #%u", params->value_handle,
+                 (unsigned)count);
+        hex_encode_and_print(prefix, data, length);
+    }
+    return BT_GATT_ITER_CONTINUE;
+}
+
+static void register_sniffer(struct bt_conn *conn) {
+    const bt_addr_le_t *peer = bt_conn_get_dst(conn);
+    int registered = 0;
+
+    for (int i = 0; i < JOYCON2_SNIFF_COUNT; i++) {
+        uint16_t handle = JOYCON2_SNIFF_FIRST_HANDLE + i;
+
+        /* These two have real subscriptions with their own callbacks --
+         * a sniffer entry would double-print every packet. */
+        if (handle == JOYCON2_INPUT_VALUE_HANDLE || handle == JOYCON2_RESPONSE_VALUE_HANDLE) {
+            continue;
+        }
+
+        sniff_counts[i] = 0;
+        struct bt_gatt_subscribe_params *p = &sniff_params[i];
+        p->value_handle = handle;
+        /* Never used (no CCC write happens), but bt_gatt_resubscribe
+         * asserts it is non-zero. */
+        p->ccc_handle = 0xffff;
+        p->value = BT_GATT_CCC_NOTIFY;
+        p->notify = sniff_notify_func;
+        int err = bt_gatt_resubscribe(0, peer, p);
+        if (err == 0) {
+            registered++;
+        }
+    }
+
+    char msg[32];
+    snprintf(msg, sizeof(msg), "JC2 SNIFF %d", registered);
+    zmk_joycon2_debug_print(msg);
+}
 
 static int jc_write_command(const uint8_t *data, size_t len) {
     if (jc_conn == NULL) {
@@ -476,7 +559,10 @@ static void scan_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
     bt_le_scan_stop();
     k_work_cancel_delayable(&scan_timeout_work);
 
-    struct bt_le_conn_param *param = BT_LE_CONN_PARAM(0x0018, 0x0028, 0, 400);
+    /* 7.5-15ms: fast enough for a 120Hz+ input stream. The previous
+     * 30-50ms request may have been too slow for the device to bother
+     * streaming (matches Android's initial 7.5ms connection). */
+    struct bt_le_conn_param *param = BT_LE_CONN_PARAM(0x0006, 0x000C, 0, 400);
     int err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN, param, &jc_conn);
     if (err) {
         LOG_ERR("joycon2: create conn failed (%d)", err);
@@ -540,6 +626,11 @@ static void jc_connected(struct bt_conn *conn, uint8_t err) {
     zmk_joycon2_debug_print("JC2 CONNECTED");
     jc_connecting = false;
 
+    /* Purely local (no on-air traffic) -- catch notifications from ANY
+     * handle in the service, registered before anything else so even
+     * immediate post-connect traffic is visible. */
+    register_sniffer(conn);
+
     /* Not required before subscribing works, but the default 23-byte ATT
      * MTU would truncate longer input-report notifications later, and no
      * known-working client against this device skips it. Subscriptions
@@ -570,9 +661,26 @@ static void jc_disconnected(struct bt_conn *conn, uint8_t reason) {
     zmk_joycon2_debug_print(msg);
 }
 
+static void jc_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_t latency,
+                                 uint16_t timeout) {
+    if (conn != jc_conn) {
+        return;
+    }
+
+    /* Report what interval the link ACTUALLY runs at -- the request in
+     * bt_conn_le_create is only a request, and the peripheral can
+     * renegotiate afterwards (Android's log showed this device moving
+     * 7.5ms -> 30ms shortly after connecting). Interval unit: 1.25ms. */
+    char msg[48];
+    snprintf(msg, sizeof(msg), "JC2 CI %u.%02ums lat=%u", (interval * 125) / 100,
+             (unsigned)((interval * 125) % 100), latency);
+    zmk_joycon2_debug_print(msg);
+}
+
 static struct bt_conn_cb jc_conn_callbacks = {
     .connected = jc_connected,
     .disconnected = jc_disconnected,
+    .le_param_updated = jc_le_param_updated,
 };
 
 int zmk_joycon2_connection_start(void) {
