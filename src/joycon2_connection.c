@@ -48,22 +48,6 @@ LOG_MODULE_REGISTER(joycon2_connection, CONFIG_ZMK_LOG_LEVEL);
 #define JOYCON2_RESPONSE_VALUE_HANDLE 0x001a
 #define JOYCON2_RESPONSE_CCC_HANDLE 0x001b
 
-/* The handshake completed successfully (confirmed via structured ACKs on
- * RESPONSE), but no data ever arrived on INPUT even after pressing
- * buttons. Subscribing to every other notify-capable characteristic in
- * the service too, to find out which one (if any) actually carries live
- * button/stick state -- the two "groups" of notify characteristics seen
- * during manual nRF Connect exploration (grouped by shared vendor
- * descriptor UUID) may carry different kinds of data. */
-#define JOYCON2_ALT1_VALUE_HANDLE 0x000e /* d5a9e01e-2ffc-4cca-b20c-8b67142bf442 */
-#define JOYCON2_ALT1_CCC_HANDLE 0x000f
-#define JOYCON2_ALT2_VALUE_HANDLE 0x001e /* 640ca58e-0e88-410c-a7f3-426faf2b690b */
-#define JOYCON2_ALT2_CCC_HANDLE 0x001f
-#define JOYCON2_ALT3_VALUE_HANDLE 0x0022 /* d3bd69d2-841c-4241-ab15-f86f406d2a80 */
-#define JOYCON2_ALT3_CCC_HANDLE 0x0023
-#define JOYCON2_ALT4_VALUE_HANDLE 0x0026 /* ab7de9be-89fe-49ad-828f-118f09df7fde */
-#define JOYCON2_ALT4_CCC_HANDLE 0x0027
-
 #define JOYCON2_SCAN_TIMEOUT_SEC 20
 #define JOYCON2_CONNECT_TIMEOUT_SEC 15
 #define JOYCON2_HANDSHAKE_STEP_DELAY_MS 500
@@ -74,10 +58,6 @@ static bool jc_connecting;
 
 static struct bt_gatt_subscribe_params input_subscribe_params;
 static struct bt_gatt_subscribe_params response_subscribe_params;
-static struct bt_gatt_subscribe_params alt1_subscribe_params;
-static struct bt_gatt_subscribe_params alt2_subscribe_params;
-static struct bt_gatt_subscribe_params alt3_subscribe_params;
-static struct bt_gatt_subscribe_params alt4_subscribe_params;
 static struct bt_gatt_exchange_params mtu_exchange_params;
 
 static struct k_work_delayable scan_timeout_work;
@@ -144,6 +124,82 @@ static bool eir_parse_cb(struct bt_data *data, void *user_data) {
     return true;
 }
 
+/* Input report layout, confirmed byte-for-byte against real captures from
+ * this hardware (battery read back as a plausible 3176mV, accel Z ~1g and
+ * gyro ~0 while at rest, sticks centred at ~2048, and the L button
+ * appearing exactly where predicted). Offsets match
+ * trevlars/switch2-controllers-linux's InputReport.parse. Reports are 63
+ * bytes -- which needs ATT MTU >= 66, the reason nothing ever arrived
+ * while the MTU sat at its 65-byte default. */
+#define JOYCON2_REPORT_MIN_LEN 8
+#define JOYCON2_REPORT_BUTTONS_OFFSET 4
+#define JOYCON2_REPORT_BATTERY_OFFSET 0x1F
+
+/* The top three bits of the button word are always set on this hardware
+ * (some always-on status flags, not buttons) -- mask to the documented
+ * button bits so they don't read as phantom presses. */
+#define JOYCON2_BUTTON_MASK 0x03FFFFFFU
+
+struct joycon2_button {
+    uint32_t mask;
+    const char *name;
+};
+
+/* Left-half buttons first since that is the unit under test; the right
+ * half's bits are included so the same decode works for either. */
+static const struct joycon2_button joycon2_buttons[] = {
+    {0x00010000, "DN"},   {0x00020000, "UP"},   {0x00040000, "RT"},
+    {0x00080000, "LF"},   {0x00100000, "SR-L"}, {0x00200000, "SL-L"},
+    {0x00400000, "L"},    {0x00800000, "ZL"},   {0x02000000, "GL"},
+    {0x00000100, "MINUS"},{0x00000800, "LSTK"}, {0x00002000, "CAP"},
+    {0x00000001, "Y"},    {0x00000002, "X"},    {0x00000004, "B"},
+    {0x00000008, "A"},    {0x00000010, "SR-R"}, {0x00000020, "SL-R"},
+    {0x00000040, "R"},    {0x00000080, "ZR"},   {0x00000200, "PLUS"},
+    {0x00000400, "RSTK"}, {0x00001000, "HOME"}, {0x00004000, "C"},
+    {0x01000000, "GR"},
+};
+
+/* Reports stream at ~60-120Hz but the HID-typing debug channel manages
+ * only a few characters per report period, so print on button-state
+ * CHANGE only -- that is both what proves the decode and the only rate a
+ * human-readable channel can sustain. */
+static void decode_input_report(const uint8_t *data, uint16_t length) {
+    static bool have_last;
+    static uint32_t last_buttons;
+
+    if (length < JOYCON2_REPORT_MIN_LEN) {
+        return;
+    }
+
+    uint32_t buttons = sys_get_le32(&data[JOYCON2_REPORT_BUTTONS_OFFSET]) & JOYCON2_BUTTON_MASK;
+    if (have_last && buttons == last_buttons) {
+        return;
+    }
+    have_last = true;
+    last_buttons = buttons;
+
+    char msg[128];
+    int n = snprintf(msg, sizeof(msg), "JC2 BTN");
+    if (buttons == 0) {
+        n += snprintf(msg + n, sizeof(msg) - n, " --");
+    } else {
+        for (size_t i = 0; i < ARRAY_SIZE(joycon2_buttons) && n > 0 && (size_t)n < sizeof(msg); i++) {
+            if (buttons & joycon2_buttons[i].mask) {
+                n += snprintf(msg + n, sizeof(msg) - n, " %s", joycon2_buttons[i].name);
+            }
+        }
+    }
+
+    /* Battery is cheap to include and doubles as a sanity check that the
+     * whole report is still being framed correctly. */
+    if (length >= JOYCON2_REPORT_BATTERY_OFFSET + 2) {
+        uint16_t mv = sys_get_le16(&data[JOYCON2_REPORT_BATTERY_OFFSET]);
+        snprintf(msg + n, sizeof(msg) - n, " %umV", mv);
+    }
+
+    zmk_joycon2_debug_print(msg);
+}
+
 static void start_handshake(void) {
     handshake_step = HANDSHAKE_LED;
     k_work_schedule(&handshake_work, K_MSEC(JOYCON2_HANDSHAKE_STEP_DELAY_MS));
@@ -159,16 +215,7 @@ static uint8_t input_notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_
         return BT_GATT_ITER_STOP;
     }
 
-    /* Input reports may stream at 120Hz+; the HID-typing debug channel
-     * types a few chars per report period at best, so print only the
-     * first few packets and then a sparse heartbeat with the count. */
-    static uint32_t input_count;
-    input_count++;
-    if (input_count <= 5 || (input_count % 256) == 0) {
-        char prefix[24];
-        snprintf(prefix, sizeof(prefix), "JC2 IN #%u", (unsigned)input_count);
-        hex_encode_and_print(prefix, data, length);
-    }
+    decode_input_report(data, length);
     return BT_GATT_ITER_CONTINUE;
 }
 
@@ -184,95 +231,6 @@ static uint8_t response_notify_func(struct bt_conn *conn, struct bt_gatt_subscri
 
     hex_encode_and_print("JC2 ACK", data, length);
     return BT_GATT_ITER_CONTINUE;
-}
-
-#define JOYCON2_ALT_NOTIFY_FUNC(name, prefix)                                                     \
-    static __maybe_unused uint8_t name(struct bt_conn *conn, struct bt_gatt_subscribe_params *params, \
-                         const void *data, uint16_t length) {                                      \
-        ARG_UNUSED(conn);                                                                           \
-        if (!data) {                                                                                \
-            params->value_handle = 0;                                                               \
-            return BT_GATT_ITER_STOP;                                                               \
-        }                                                                                            \
-        hex_encode_and_print(prefix, data, length);                                                 \
-        return BT_GATT_ITER_CONTINUE;                                                               \
-    }
-
-JOYCON2_ALT_NOTIFY_FUNC(alt1_notify_func, "JC2 ALT1")
-JOYCON2_ALT_NOTIFY_FUNC(alt2_notify_func, "JC2 ALT2")
-JOYCON2_ALT_NOTIFY_FUNC(alt3_notify_func, "JC2 ALT3")
-JOYCON2_ALT_NOTIFY_FUNC(alt4_notify_func, "JC2 ALT4")
-
-/* Catch-all notification sniffer.
- *
- * Five of the service's characteristics carry the Notify property but no
- * CCC descriptor (per the nRF Connect service dump). A hand-rolled GATT
- * server can send notifications on such handles unconditionally -- and
- * both Android (setCharacteristicNotification local filter) and Zephyr
- * (bt_gatt_notification drops handles with no matching subscription)
- * would silently discard them. So the input stream may already be
- * flowing on a handle nobody has ever listened to.
- *
- * bt_gatt_resubscribe() registers a local subscription entry WITHOUT
- * writing any CCC (no on-air traffic), so covering every handle in the
- * service is free and makes any notification from any handle visible.
- */
-#define JOYCON2_SNIFF_FIRST_HANDLE 0x0001
-#define JOYCON2_SNIFF_LAST_HANDLE 0x0030
-#define JOYCON2_SNIFF_COUNT (JOYCON2_SNIFF_LAST_HANDLE - JOYCON2_SNIFF_FIRST_HANDLE + 1)
-
-static struct bt_gatt_subscribe_params sniff_params[JOYCON2_SNIFF_COUNT];
-static uint32_t sniff_counts[JOYCON2_SNIFF_COUNT];
-
-static uint8_t sniff_notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_params *params,
-                                  const void *data, uint16_t length) {
-    ARG_UNUSED(conn);
-
-    if (!data) {
-        return BT_GATT_ITER_STOP;
-    }
-
-    uint16_t idx = params->value_handle - JOYCON2_SNIFF_FIRST_HANDLE;
-    uint32_t count = ++sniff_counts[idx];
-    if (count <= 3 || (count % 256) == 0) {
-        char prefix[32];
-        snprintf(prefix, sizeof(prefix), "JC2 N%04X #%u", params->value_handle,
-                 (unsigned)count);
-        hex_encode_and_print(prefix, data, length);
-    }
-    return BT_GATT_ITER_CONTINUE;
-}
-
-static void register_sniffer(struct bt_conn *conn) {
-    const bt_addr_le_t *peer = bt_conn_get_dst(conn);
-    int registered = 0;
-
-    for (int i = 0; i < JOYCON2_SNIFF_COUNT; i++) {
-        uint16_t handle = JOYCON2_SNIFF_FIRST_HANDLE + i;
-
-        /* These two have real subscriptions with their own callbacks --
-         * a sniffer entry would double-print every packet. */
-        if (handle == JOYCON2_INPUT_VALUE_HANDLE || handle == JOYCON2_RESPONSE_VALUE_HANDLE) {
-            continue;
-        }
-
-        sniff_counts[i] = 0;
-        struct bt_gatt_subscribe_params *p = &sniff_params[i];
-        p->value_handle = handle;
-        /* Never used (no CCC write happens), but bt_gatt_resubscribe
-         * asserts it is non-zero. */
-        p->ccc_handle = 0xffff;
-        p->value = BT_GATT_CCC_NOTIFY;
-        p->notify = sniff_notify_func;
-        int err = bt_gatt_resubscribe(0, peer, p);
-        if (err == 0) {
-            registered++;
-        }
-    }
-
-    char msg[32];
-    snprintf(msg, sizeof(msg), "JC2 SNIFF %d", registered);
-    zmk_joycon2_debug_print(msg);
 }
 
 static int jc_write_command(const uint8_t *data, size_t len) {
@@ -352,14 +310,6 @@ static void subscribe_cb(struct bt_conn *conn, uint8_t err, struct bt_gatt_subsc
         name = "IN";
     } else if (params == &response_subscribe_params) {
         name = "RESP";
-    } else if (params == &alt1_subscribe_params) {
-        name = "ALT1";
-    } else if (params == &alt2_subscribe_params) {
-        name = "ALT2";
-    } else if (params == &alt3_subscribe_params) {
-        name = "ALT3";
-    } else if (params == &alt4_subscribe_params) {
-        name = "ALT4";
     }
 
     char msg[48];
@@ -404,41 +354,6 @@ static void start_subscriptions(struct bt_conn *conn) {
         LOG_ERR("joycon2: response subscribe failed (%d)", err);
         zmk_joycon2_debug_print("JC2 RESPONSE SUBSCRIBE FAILED");
     }
-
-    /* The reference implementation (JoyCon2Mac's BLEManager.mm) only ever
-     * calls setNotifyValue on the input and response characteristics --
-     * it never subscribes to these four "ALT" channels at all. Skipping
-     * them here to match that exactly, in case subscribing to extras the
-     * device doesn't expect is interfering with input notifications. */
-#if 0
-    alt1_subscribe_params.value_handle = JOYCON2_ALT1_VALUE_HANDLE;
-    alt1_subscribe_params.ccc_handle = JOYCON2_ALT1_CCC_HANDLE;
-    alt1_subscribe_params.notify = alt1_notify_func;
-    alt1_subscribe_params.subscribe = subscribe_cb;
-    alt1_subscribe_params.value = BT_GATT_CCC_NOTIFY;
-    bt_gatt_subscribe(conn, &alt1_subscribe_params);
-
-    alt2_subscribe_params.value_handle = JOYCON2_ALT2_VALUE_HANDLE;
-    alt2_subscribe_params.ccc_handle = JOYCON2_ALT2_CCC_HANDLE;
-    alt2_subscribe_params.notify = alt2_notify_func;
-    alt2_subscribe_params.subscribe = subscribe_cb;
-    alt2_subscribe_params.value = BT_GATT_CCC_NOTIFY;
-    bt_gatt_subscribe(conn, &alt2_subscribe_params);
-
-    alt3_subscribe_params.value_handle = JOYCON2_ALT3_VALUE_HANDLE;
-    alt3_subscribe_params.ccc_handle = JOYCON2_ALT3_CCC_HANDLE;
-    alt3_subscribe_params.notify = alt3_notify_func;
-    alt3_subscribe_params.subscribe = subscribe_cb;
-    alt3_subscribe_params.value = BT_GATT_CCC_NOTIFY;
-    bt_gatt_subscribe(conn, &alt3_subscribe_params);
-
-    alt4_subscribe_params.value_handle = JOYCON2_ALT4_VALUE_HANDLE;
-    alt4_subscribe_params.ccc_handle = JOYCON2_ALT4_CCC_HANDLE;
-    alt4_subscribe_params.notify = alt4_notify_func;
-    alt4_subscribe_params.subscribe = subscribe_cb;
-    alt4_subscribe_params.value = BT_GATT_CCC_NOTIFY;
-    bt_gatt_subscribe(conn, &alt4_subscribe_params);
-#endif
 
     zmk_joycon2_debug_print("JC2 SUBSCRIBED");
     /* start_handshake resets handshake_step -- without it a reconnect
@@ -566,11 +481,6 @@ static void jc_connected(struct bt_conn *conn, uint8_t err) {
     LOG_INF("joycon2: connected, subscribing");
     zmk_joycon2_debug_print("JC2 CONNECTED");
     jc_connecting = false;
-
-    /* Purely local (no on-air traffic) -- catch notifications from ANY
-     * handle in the service, registered before anything else so even
-     * immediate post-connect traffic is visible. */
-    register_sniffer(conn);
 
     /* Not required before subscribing works, but the default 23-byte ATT
      * MTU would truncate longer input-report notifications later, and no
