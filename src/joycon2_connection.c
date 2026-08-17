@@ -677,10 +677,30 @@ static void jc_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_
     zmk_joycon2_debug_print(msg);
 }
 
+#if defined(CONFIG_BT_USER_DATA_LEN_UPDATE)
+static void jc_le_data_len_updated(struct bt_conn *conn, struct bt_conn_le_data_len_info *info) {
+    if (conn != jc_conn) {
+        return;
+    }
+
+    /* Direct observation of whether Data Length Extension actually
+     * negotiated on this link (tx/rx = max Link Layer payload bytes;
+     * 27 = no DLE, 251 = full). A 62-byte input report needs 70 bytes
+     * on-air, and the hypothesis is Nintendo's input hot path refuses
+     * to fragment across 27-byte PDUs. */
+    char msg[48];
+    snprintf(msg, sizeof(msg), "JC2 DLE tx=%u rx=%u", info->tx_max_len, info->rx_max_len);
+    zmk_joycon2_debug_print(msg);
+}
+#endif
+
 static struct bt_conn_cb jc_conn_callbacks = {
     .connected = jc_connected,
     .disconnected = jc_disconnected,
     .le_param_updated = jc_le_param_updated,
+#if defined(CONFIG_BT_USER_DATA_LEN_UPDATE)
+    .le_data_len_updated = jc_le_data_len_updated,
+#endif
 };
 
 int zmk_joycon2_connection_start(void) {
