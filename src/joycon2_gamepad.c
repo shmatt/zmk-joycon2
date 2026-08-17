@@ -64,20 +64,22 @@ LOG_MODULE_REGISTER(joycon2_gamepad, CONFIG_ZMK_LOG_LEVEL);
 
 /* Logical slots.
  *
- * The index values are NOT consecutive, and that matters: Android maps HID
- * button N to a fixed keycode sequence which contains two slots nothing
- * uses, so packing buttons consecutively shifts everything after the face
- * cluster onto the wrong keycodes.
+ * The index values are NOT consecutive, and the order past button 10 is not
+ * the obvious one. Android's HID driver follows the Linux BTN_* gamepad
+ * ordering, which contains two vestigial entries no app reads and puts the
+ * stick clicks at the very end:
  *
- *   HID button:  1  2  3  4  5  6  7   8   9   10  11      12      13     14      15
- *   Android:     A  B  C  X  Y  Z  L1  R1  L2  R2  ThumbL  ThumbR  Start  Select  Mode
+ *   HID button: 1  2  3  4  5  6  7   8   9   10  11      12     13    14      15
+ *   Android:    A  B  C  X  Y  Z  L1  R1  L2  R2  Select  Start  Mode  ThumbL  ThumbR
+ *   keycode:    96 97 98 99 100 101 102 103 104 105 109   108    110   106     107
  *
- * BUTTON_C (3) and BUTTON_Z (6) are vestigial and no app reads them, so the
- * four face buttons are 1, 2, 4, 5 -- skipping 3 -- and the shoulders start
- * at 7. Values below are 0-based, so index = HID button - 1.
+ * So the face buttons are 1, 2, 4, 5 (skipping C) and the shoulders start at
+ * 7 (skipping Z). All of this was derived by reading back the keycodes a
+ * gamepad tester reported for known inputs. Values below are 0-based, so
+ * index = HID button - 1.
  */
 enum joycon2_pad_button {
-    PAD_FACE_DOWN = 0, /* A      */
+    PAD_FACE_DOWN = 0,  /* A      */
     PAD_FACE_RIGHT = 1, /* B      */
     PAD_FACE_LEFT = 3,  /* X      */
     PAD_FACE_UP = 4,    /* Y      */
@@ -85,15 +87,15 @@ enum joycon2_pad_button {
     PAD_R1 = 7,
     PAD_L2 = 8,
     PAD_R2 = 9,
-    PAD_THUMBL = 10,
-    PAD_THUMBR = 11,
-    PAD_START = 12,
-    PAD_SELECT = 13,
-    PAD_MODE = 14,
-    /* Past Mode, Android exposes BUTTON_1..16 (keycodes 188+), which are not
-     * D-pad keycodes. A proper D-pad needs a hat switch in the report
-     * descriptor; until then DUO's D-pad lands on these generic slots, which
-     * apps can at least bind individually. */
+    PAD_SELECT = 10,
+    PAD_START = 11,
+    PAD_MODE = 12,
+    PAD_THUMBL = 13, /* left stick click, "L3"  */
+    PAD_THUMBR = 14, /* right stick click, "R3" */
+    /* Past ThumbR, Android exposes BUTTON_1..16 (keycodes 188+), which are
+     * generic and NOT D-pad keycodes. A real D-pad needs a hat switch in the
+     * report descriptor; until then DUO's D-pad lands on these, which apps
+     * can at least bind individually. */
     PAD_GENERIC_1 = 15,
     PAD_GENERIC_2 = 16,
     PAD_GENERIC_3 = 17,
@@ -107,16 +109,21 @@ struct joycon2_profile_map {
 
 /* SOLO: a single Joy-Con held UPRIGHT in one hand.
  *
- * Its own shoulder pair keeps its natural side, and the rail buttons stand
- * in for the pair the missing half would have provided -- so on the right
- * half SR/SL become L1/L2, and on the left half they become R1/R2. The
- * half's single stick acts as the left stick, so its click is ThumbL.
+ * Its own shoulder pair keeps its natural side, and the rail buttons stand in
+ * for the pair the missing half would have provided -- so on the right half
+ * SR/SL become L1/L2, and on the left half they become R1/R2. The half's
+ * single stick acts as the left stick, so its click is ThumbL.
+ *
+ * The system buttons are deliberately not the conventional assignment: Home
+ * (right) and Capture (left) are Start, while Plus/Minus are Mode. With only
+ * one half in hand there is just one menu button to go around, and this is
+ * what testing settled on.
  */
 static const struct joycon2_profile_map solo_left = {
     .buttons =
         {
-            /* The D-pad serves as the face cluster: there is no second half
-             * to provide one, and it sits under the thumb. Positions match
+            /* The D-pad serves as the face cluster -- there is no second half
+             * to provide one, and it falls under the thumb. Positions match
              * the face buttons they stand in for. */
             [PAD_FACE_DOWN] = JC2_DOWN,
             [PAD_FACE_RIGHT] = JC2_RIGHT,
@@ -126,9 +133,9 @@ static const struct joycon2_profile_map solo_left = {
             [PAD_L2] = JC2_ZL,
             [PAD_R1] = JC2_SR_L,
             [PAD_R2] = JC2_SL_L,
+            [PAD_START] = JC2_CAPTURE,
+            [PAD_MODE] = JC2_MINUS,
             [PAD_THUMBL] = JC2_LSTK,
-            [PAD_START] = JC2_MINUS,
-            [PAD_SELECT] = JC2_CAPTURE,
         },
 };
 
@@ -146,24 +153,26 @@ static const struct joycon2_profile_map solo_right = {
             [PAD_L2] = JC2_SL_R,
             [PAD_R1] = JC2_R,
             [PAD_R2] = JC2_ZR,
-            [PAD_THUMBL] = JC2_RSTK,
-            [PAD_START] = JC2_PLUS,
             [PAD_SELECT] = JC2_C,
-            [PAD_MODE] = JC2_HOME,
+            [PAD_START] = JC2_HOME,
+            [PAD_MODE] = JC2_PLUS,
+            [PAD_THUMBL] = JC2_RSTK,
         },
 };
 
 /* DUO: both halves held upright as one pad, so every control keeps its
- * natural role. The two tables map disjoint physical buttons and each half
- * only writes its own indices, so the host sees one merged pad. The rail
- * buttons are free here, since both real shoulder pairs are present. */
+ * natural role -- and with all the system buttons available, they take their
+ * conventional assignments rather than the solo compromises above. The two
+ * tables map disjoint physical buttons and each half only writes its own
+ * indices, so the host sees one merged pad. The rail buttons are free here,
+ * since both real shoulder pairs are present. */
 static const struct joycon2_profile_map duo_left = {
     .buttons =
         {
             [PAD_L1] = JC2_L,
             [PAD_L2] = JC2_ZL,
-            [PAD_THUMBL] = JC2_LSTK,
             [PAD_SELECT] = JC2_MINUS,
+            [PAD_THUMBL] = JC2_LSTK,
             [PAD_GENERIC_1] = JC2_UP,
             [PAD_GENERIC_2] = JC2_DOWN,
             [PAD_GENERIC_3] = JC2_LEFT,
@@ -180,9 +189,9 @@ static const struct joycon2_profile_map duo_right = {
             [PAD_FACE_UP] = JC2_X,
             [PAD_R1] = JC2_R,
             [PAD_R2] = JC2_ZR,
-            [PAD_THUMBR] = JC2_RSTK,
             [PAD_START] = JC2_PLUS,
             [PAD_MODE] = JC2_HOME,
+            [PAD_THUMBR] = JC2_RSTK,
         },
 };
 
