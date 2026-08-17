@@ -99,18 +99,16 @@ enum joycon2_pad_button {
     PAD_THUMBL = 13, /* left stick click, "L3"  */
     PAD_THUMBR = 14, /* right stick click, "R3" */
     /* Past ThumbR, Android exposes BUTTON_1..16 (keycodes 188+), which are
-     * generic and NOT D-pad keycodes. A real D-pad needs a hat switch in the
-     * report descriptor; until then DUO's D-pad lands on these, which apps
-     * can at least bind individually. */
-    PAD_GENERIC_1 = 15,
-    PAD_GENERIC_2 = 16,
-    PAD_GENERIC_3 = 17,
-    PAD_GENERIC_4 = 18,
+     * generic and not D-pad keycodes -- the D-pad goes through the report's
+     * hat switch instead (see dpad_to_hat below). */
 };
 
 /* Index = HID button number - 1. 0 means "nothing mapped at this index". */
 struct joycon2_profile_map {
     uint32_t buttons[JOYCON2_GAMEPAD_NUM_BUTTONS];
+    /* Send this half's D-pad through the hat switch. Only duo does: in solo
+     * the D-pad stands in for the missing face cluster instead. */
+    bool dpad_to_hat;
 };
 
 /* SOLO: a single Joy-Con held UPRIGHT in one hand.
@@ -186,11 +184,8 @@ static const struct joycon2_profile_map duo_left = {
             [PAD_Z] = JC2_MINUS,
             [PAD_SELECT] = JC2_CAPTURE,
             [PAD_THUMBL] = JC2_LSTK,
-            [PAD_GENERIC_1] = JC2_UP,
-            [PAD_GENERIC_2] = JC2_DOWN,
-            [PAD_GENERIC_3] = JC2_LEFT,
-            [PAD_GENERIC_4] = JC2_RIGHT,
         },
+    .dpad_to_hat = true,
 };
 
 static const struct joycon2_profile_map duo_right = {
@@ -202,8 +197,10 @@ static const struct joycon2_profile_map duo_right = {
             [PAD_FACE_UP] = JC2_X,
             [PAD_R1] = JC2_R,
             [PAD_R2] = JC2_ZR,
-            [PAD_START] = JC2_PLUS,
-            [PAD_MODE] = JC2_HOME,
+            /* Home is Start and Plus is Mode, matching solo, so the same
+             * button does the same thing in either profile. */
+            [PAD_START] = JC2_HOME,
+            [PAD_MODE] = JC2_PLUS,
             [PAD_THUMBR] = JC2_RSTK,
             /* The other app-usable spare, and a natural home for the
              * physical C button. */
@@ -318,6 +315,11 @@ void zmk_joycon2_gamepad_update(enum zmk_joycon2_side side, uint32_t buttons, ui
                 zmk_hid_gamepad_button_release(i);
             }
         }
+    }
+
+    if (map->dpad_to_hat) {
+        zmk_hid_gamepad_dpad_set(buttons & JC2_UP, buttons & JC2_DOWN, buttons & JC2_LEFT,
+                                  buttons & JC2_RIGHT);
     }
 
     /* Absolute stick position, not a mouse-style delta. A lone Joy-Con is
