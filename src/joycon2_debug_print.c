@@ -111,7 +111,10 @@ static struct k_work_delayable print_work;
  * milestones fire within the same BLE event) queue up instead of silently
  * dropping -- losing exactly the message that would explain what happened
  * has cost real debugging time more than once. */
-#define JOYCON2_DEBUG_PRINT_QUEUE_DEPTH 4
+/* Depth 4 proved too shallow: the connect burst (CONNECTED/SNIFF/MTU/
+ * SUBSCRIBED/CCC/DLE) dropped its tail every time, hiding exactly the
+ * diagnostics that mattered (third occurrence of this failure mode). */
+#define JOYCON2_DEBUG_PRINT_QUEUE_DEPTH 12
 
 static char queue_bufs[JOYCON2_DEBUG_PRINT_QUEUE_DEPTH][JOYCON2_DEBUG_PRINT_BUF_SIZE];
 static size_t queue_lens[JOYCON2_DEBUG_PRINT_QUEUE_DEPTH];

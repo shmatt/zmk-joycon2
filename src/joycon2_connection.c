@@ -84,16 +84,20 @@ static struct k_work_delayable scan_timeout_work;
 static struct k_work_delayable connect_timeout_work;
 static struct k_work_delayable handshake_work;
 
+/* Sequence and ordering match switch2-controllers-linux (the only known
+ * working implementation at the raw-ATT level): subscribe RESPONSE ->
+ * LED -> vibration preset -> feature-init -> feature-enable -> subscribe
+ * INPUT **last**. In that implementation the input CCCD write is the
+ * final step after features are enabled -- if it doubles as the "start
+ * streaming" trigger, writing it first (as we did before) arms nothing.
+ * MAC-binding ("bond") is optional reconnect persistence there, not part
+ * of init, so it is dropped from the handshake entirely for now. */
 enum handshake_step {
-    HANDSHAKE_IMU_1,
-    HANDSHAKE_IMU_2,
-    HANDSHAKE_VIBRATION_CONFIG,
     HANDSHAKE_LED,
     HANDSHAKE_PAIRING_VIBRATION,
-    HANDSHAKE_MAC_1,
-    HANDSHAKE_MAC_2,
-    HANDSHAKE_MAC_3,
-    HANDSHAKE_MAC_4,
+    HANDSHAKE_IMU_1,
+    HANDSHAKE_IMU_2,
+    HANDSHAKE_SUBSCRIBE_INPUT,
     HANDSHAKE_DONE,
 };
 
@@ -141,7 +145,7 @@ static bool eir_parse_cb(struct bt_data *data, void *user_data) {
 }
 
 static void start_handshake(void) {
-    handshake_step = HANDSHAKE_IMU_1;
+    handshake_step = HANDSHAKE_LED;
     k_work_schedule(&handshake_work, K_MSEC(JOYCON2_HANDSHAKE_STEP_DELAY_MS));
 }
 
@@ -281,51 +285,16 @@ static int jc_write_command(const uint8_t *data, size_t len) {
     return bt_gatt_write_without_response(jc_conn, JOYCON2_COMMAND_VALUE_HANDLE, data, len, false);
 }
 
+static void subscribe_input(void);
+
 static void handshake_work_handler(struct k_work *work) {
     ARG_UNUSED(work);
 
-    static uint8_t mac1[6];
-    static uint8_t mac2[6];
-    uint8_t buf[22];
     int err;
 
     switch (handshake_step) {
-    case HANDSHAKE_IMU_1: {
-        static const uint8_t cmd[] = {0x0C, 0x91, 0x01, 0x02, 0x00, 0x04,
-                                       0x00, 0x00, 0xFF, 0x00, 0x00, 0x00};
-        err = jc_write_command(cmd, sizeof(cmd));
-        LOG_INF("joycon2: IMU enable step1 (%d)", err);
-        break;
-    }
-    case HANDSHAKE_IMU_2: {
-        static const uint8_t cmd[] = {0x0C, 0x91, 0x01, 0x04, 0x00, 0x04,
-                                       0x00, 0x00, 0xFF, 0x00, 0x00, 0x00};
-        err = jc_write_command(cmd, sizeof(cmd));
-        LOG_INF("joycon2: IMU enable step2 (%d)", err);
-        break;
-    }
-    case HANDSHAKE_VIBRATION_CONFIG: {
-        /* JoyCon2Mac's full pre-MAC-binding sequence is IMU-enable x2 ->
-         * vibration-config -> set-LED -> pairing-vibration, all gating the
-         * same "isInitialized" flag before MAC-binding fires -- we'd only
-         * been sending the LED step. Adding the other two in case they
-         * matter for unlocking input streaming specifically. */
-        static const uint8_t cmd[] = {0x0A, 0x91, 0x01, 0x08, 0x00, 0x14, 0x00, 0x00, 0x01, 0xFF,
-                                       0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x35, 0x00, 0x46,
-                                       0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-        err = jc_write_command(cmd, sizeof(cmd));
-        LOG_INF("joycon2: vibration config (%d)", err);
-        break;
-    }
     case HANDSHAKE_LED: {
-        /* JoyCon2Mac sends this unconditionally right after IMU-enable,
-         * before MAC-binding even starts, and treats it as part of
-         * declaring the connection established -- our handshake was
-         * missing it entirely, which is the likely reason the player LEDs
-         * never left "searching" mode despite every other step succeeding.
-         * ledMask 0x01 = Left/player-1-style pattern (JoyCon2Mac's
-         * default for a Left-side controller; exact player number doesn't
-         * matter for proving the LEDs react at all). */
+        /* ledMask 0x01 = player-1 pattern. */
         static const uint8_t cmd[] = {0x09, 0x91, 0x01, 0x07, 0x00, 0x08, 0x00, 0x00,
                                        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
         err = jc_write_command(cmd, sizeof(cmd));
@@ -333,75 +302,34 @@ static void handshake_work_handler(struct k_work *work) {
         break;
     }
     case HANDSHAKE_PAIRING_VIBRATION: {
+        /* "Play vibration preset 3" -- the connected/pairing buzz. */
         static const uint8_t cmd[] = {0x0A, 0x91, 0x01, 0x02, 0x00, 0x04,
                                        0x00, 0x00, 0x03, 0x00, 0x00, 0x00};
         err = jc_write_command(cmd, sizeof(cmd));
         LOG_INF("joycon2: pairing vibration (%d)", err);
         break;
     }
-    case HANDSHAKE_MAC_1: {
-        bt_addr_le_t addrs[CONFIG_BT_ID_MAX];
-        size_t count = ARRAY_SIZE(addrs);
-
-        bt_id_get(addrs, &count);
-        if (count == 0) {
-            LOG_ERR("joycon2: no local BT identity address");
-            zmk_joycon2_debug_print("JC2 NO LOCAL BT ADDR");
-            handshake_step = HANDSHAKE_DONE;
-            return;
-        }
-
-        /* MAC-binding step 1 wants the host's own address, byte-reversed;
-         * MAC2 is the same reversed address with its first byte
-         * decremented by one (the "no second address supplied" fallback
-         * JoyCon2Mac itself always hits in practice). */
-        for (int i = 0; i < 6; i++) {
-            mac1[i] = addrs[0].a.val[5 - i];
-        }
-        memcpy(mac2, mac1, sizeof(mac2));
-        mac2[0] = mac1[0] - 1;
-
-        buf[0] = 0x15;
-        buf[1] = 0x91;
-        buf[2] = 0x01;
-        buf[3] = 0x01;
-        buf[4] = 0x00;
-        buf[5] = 0x0E;
-        buf[6] = 0x00;
-        buf[7] = 0x00;
-        buf[8] = 0x00;
-        buf[9] = 0x02;
-        memcpy(&buf[10], mac1, sizeof(mac1));
-        memcpy(&buf[16], mac2, sizeof(mac2));
-
-        err = jc_write_command(buf, sizeof(buf));
-        LOG_INF("joycon2: MAC-bind step1 (%d)", err);
+    case HANDSHAKE_IMU_1: {
+        /* Feature-init, flags 0xFF = all features (0x0C/0x02). */
+        static const uint8_t cmd[] = {0x0C, 0x91, 0x01, 0x02, 0x00, 0x04,
+                                       0x00, 0x00, 0xFF, 0x00, 0x00, 0x00};
+        err = jc_write_command(cmd, sizeof(cmd));
+        LOG_INF("joycon2: feature init (%d)", err);
         break;
     }
-    case HANDSHAKE_MAC_2: {
-        static const uint8_t cmd[] = {0x15, 0x91, 0x01, 0x04, 0x00, 0x11, 0x00, 0x00, 0x00,
-                                       0x08, 0x06, 0x5A, 0x60, 0xE9, 0x02, 0xE4, 0xE1, 0x02,
-                                       0x02, 0x9E, 0x3F, 0xA3, 0x9A, 0x78, 0xD1};
+    case HANDSHAKE_IMU_2: {
+        /* Feature-enable, same flags (0x0C/0x04). */
+        static const uint8_t cmd[] = {0x0C, 0x91, 0x01, 0x04, 0x00, 0x04,
+                                       0x00, 0x00, 0xFF, 0x00, 0x00, 0x00};
         err = jc_write_command(cmd, sizeof(cmd));
-        LOG_INF("joycon2: MAC-bind step2 (%d)", err);
+        LOG_INF("joycon2: feature enable (%d)", err);
         break;
     }
-    case HANDSHAKE_MAC_3: {
-        static const uint8_t cmd[] = {0x15, 0x91, 0x01, 0x02, 0x00, 0x11, 0x00, 0x00, 0x00,
-                                       0x93, 0x4E, 0x58, 0x0F, 0x16, 0x3A, 0xEE, 0xCF, 0xB5,
-                                       0x75, 0xFC, 0x91, 0x36, 0xB2, 0x2F, 0xBB};
-        err = jc_write_command(cmd, sizeof(cmd));
-        LOG_INF("joycon2: MAC-bind step3 (%d)", err);
-        break;
-    }
-    case HANDSHAKE_MAC_4: {
-        static const uint8_t cmd[] = {0x15, 0x91, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00};
-        err = jc_write_command(cmd, sizeof(cmd));
-        LOG_INF("joycon2: MAC-bind step4 (%d)", err);
+    case HANDSHAKE_SUBSCRIBE_INPUT:
+        subscribe_input();
         zmk_joycon2_debug_print("JC2 HANDSHAKE SENT");
         handshake_step = HANDSHAKE_DONE;
         return;
-    }
     default:
         return;
     }
@@ -439,21 +367,32 @@ static void subscribe_cb(struct bt_conn *conn, uint8_t err, struct bt_gatt_subsc
     zmk_joycon2_debug_print(msg);
 }
 
-static void start_subscriptions(struct bt_conn *conn) {
-    /* Explicit ccc_handle (rather than .disc_params) skips CCC
-     * auto-discovery entirely -- that path also uses a READ_BY_TYPE-style
-     * op internally and would likely hit the same wall as characteristic
-     * discovery did. */
+/* Deliberately called LAST, after feature-enable, matching the working
+ * Linux implementation's ordering -- see the handshake_step comment. */
+static void subscribe_input(void) {
+    if (!jc_conn) {
+        return;
+    }
+
     input_subscribe_params.value_handle = JOYCON2_INPUT_VALUE_HANDLE;
     input_subscribe_params.ccc_handle = JOYCON2_INPUT_CCC_HANDLE;
     input_subscribe_params.notify = input_notify_func;
     input_subscribe_params.subscribe = subscribe_cb;
     input_subscribe_params.value = BT_GATT_CCC_NOTIFY;
-    int err = bt_gatt_subscribe(conn, &input_subscribe_params);
+    int err = bt_gatt_subscribe(jc_conn, &input_subscribe_params);
     if (err && err != -EALREADY) {
         LOG_ERR("joycon2: input subscribe failed (%d)", err);
         zmk_joycon2_debug_print("JC2 INPUT SUBSCRIBE FAILED");
     }
+}
+
+static void start_subscriptions(struct bt_conn *conn) {
+    /* Explicit ccc_handle (rather than .disc_params) skips CCC
+     * auto-discovery entirely -- that path also uses a READ_BY_TYPE-style
+     * op internally and would likely hit the same wall as characteristic
+     * discovery did. Only RESPONSE is subscribed here; INPUT is subscribed
+     * as the handshake's final step. */
+    int err;
 
     response_subscribe_params.value_handle = JOYCON2_RESPONSE_VALUE_HANDLE;
     response_subscribe_params.ccc_handle = JOYCON2_RESPONSE_CCC_HANDLE;
@@ -502,7 +441,9 @@ static void start_subscriptions(struct bt_conn *conn) {
 #endif
 
     zmk_joycon2_debug_print("JC2 SUBSCRIBED");
-    k_work_schedule(&handshake_work, K_MSEC(JOYCON2_SUBSCRIBE_TO_HANDSHAKE_DELAY_MS));
+    /* start_handshake resets handshake_step -- without it a reconnect
+     * would find the step still at HANDSHAKE_DONE and never handshake. */
+    start_handshake();
 }
 
 static void mtu_exchange_cb(struct bt_conn *conn, uint8_t err,
