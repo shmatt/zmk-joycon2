@@ -15,6 +15,7 @@
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gap.h>
+#include <zephyr/bluetooth/hci.h>
 
 #include <zmk/joycon2/central_test.h>
 #include <zmk/joycon2/debug_print.h>
@@ -186,8 +187,17 @@ int zmk_joycon2_central_test_start(void) {
         return -EBUSY;
     }
 
+    if (test_conn != NULL) {
+        /* Previous test connection never got torn down (e.g. re-triggered
+         * before the peer disconnected) -- release it properly so repeated
+         * presses can't leak connection slots. */
+        k_work_cancel_delayable(&test_still_alive_work);
+        bt_conn_disconnect(test_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+        bt_conn_unref(test_conn);
+        test_conn = NULL;
+    }
+
     test_in_progress = true;
-    test_conn = NULL;
 
     int err = bt_le_scan_start(BT_LE_SCAN_PASSIVE, scan_found);
     if (err) {
