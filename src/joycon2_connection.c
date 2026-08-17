@@ -172,7 +172,7 @@ static uint8_t response_notify_func(struct bt_conn *conn, struct bt_gatt_subscri
 }
 
 #define JOYCON2_ALT_NOTIFY_FUNC(name, prefix)                                                     \
-    static uint8_t name(struct bt_conn *conn, struct bt_gatt_subscribe_params *params,             \
+    static __maybe_unused uint8_t name(struct bt_conn *conn, struct bt_gatt_subscribe_params *params, \
                          const void *data, uint16_t length) {                                      \
         ARG_UNUSED(conn);                                                                           \
         if (!data) {                                                                                \
@@ -383,6 +383,12 @@ static void start_subscriptions(struct bt_conn *conn) {
         zmk_joycon2_debug_print("JC2 RESPONSE SUBSCRIBE FAILED");
     }
 
+    /* The reference implementation (JoyCon2Mac's BLEManager.mm) only ever
+     * calls setNotifyValue on the input and response characteristics --
+     * it never subscribes to these four "ALT" channels at all. Skipping
+     * them here to match that exactly, in case subscribing to extras the
+     * device doesn't expect is interfering with input notifications. */
+#if 0
     alt1_subscribe_params.value_handle = JOYCON2_ALT1_VALUE_HANDLE;
     alt1_subscribe_params.ccc_handle = JOYCON2_ALT1_CCC_HANDLE;
     alt1_subscribe_params.notify = alt1_notify_func;
@@ -410,6 +416,7 @@ static void start_subscriptions(struct bt_conn *conn) {
     alt4_subscribe_params.subscribe = subscribe_cb;
     alt4_subscribe_params.value = BT_GATT_CCC_NOTIFY;
     bt_gatt_subscribe(conn, &alt4_subscribe_params);
+#endif
 
     zmk_joycon2_debug_print("JC2 SUBSCRIBED");
     k_work_schedule(&handshake_work, K_MSEC(JOYCON2_SUBSCRIBE_TO_HANDSHAKE_DELAY_MS));
