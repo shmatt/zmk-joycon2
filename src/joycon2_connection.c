@@ -75,6 +75,9 @@ enum handshake_step {
 
 static enum handshake_step handshake_step;
 
+static uint8_t service_discovery_func(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+                                       struct bt_gatt_discover_params *params);
+
 static void hex_encode_and_print(const char *prefix, const uint8_t *data, uint16_t length) {
     char msg[128];
     int n = snprintf(msg, sizeof(msg), "%s ", prefix);
@@ -114,6 +117,24 @@ static bool eir_parse_cb(struct bt_data *data, void *user_data) {
     return true;
 }
 
+static void start_primary_discovery(struct bt_conn *conn) {
+    memset(&discover_params, 0, sizeof(discover_params));
+    discover_params.uuid = &joycon2_uuid_service.uuid;
+    discover_params.func = service_discovery_func;
+    discover_params.start_handle = 0x0001;
+    discover_params.end_handle = 0xffff;
+    discover_params.type = BT_GATT_DISCOVER_PRIMARY;
+
+    int rc = bt_gatt_discover(conn, &discover_params);
+    if (rc) {
+        LOG_ERR("joycon2: discover failed (%d)", rc);
+        zmk_joycon2_debug_print("JC2 DISCOVER FAILED");
+        return;
+    }
+
+    k_work_schedule(&discover_timeout_work, K_SECONDS(JOYCON2_DISCOVER_TIMEOUT_SEC));
+}
+
 static void mtu_exchange_cb(struct bt_conn *conn, uint8_t err,
                              struct bt_gatt_exchange_params *params) {
     ARG_UNUSED(params);
@@ -123,6 +144,11 @@ static void mtu_exchange_cb(struct bt_conn *conn, uint8_t err,
     } else {
         LOG_INF("joycon2: MTU exchange succeeded, ATT MTU=%u", bt_gatt_get_mtu(conn));
     }
+
+    /* ATT only allows one outstanding request at a time per connection --
+     * wait for this to actually complete (success or failure) before
+     * starting discovery, rather than firing both concurrently as before. */
+    start_primary_discovery(conn);
 }
 
 static void start_handshake(void) {
@@ -490,30 +516,19 @@ static void jc_connected(struct bt_conn *conn, uint8_t err) {
     LOG_INF("joycon2: connected, discovering service");
     zmk_joycon2_debug_print("JC2 CONNECTED");
 
-    /* Fire-and-forget: not required before discovery works, but the default
-     * 23-byte ATT MTU would truncate longer input-report notifications
-     * later, and no known-working client against this device skips it. */
+    /* Not required for discovery to work, but the default 23-byte ATT MTU
+     * would truncate longer input-report notifications later, and no
+     * known-working client against this device skips it. Discovery starts
+     * from mtu_exchange_cb once this actually completes -- ATT only allows
+     * one outstanding request at a time per connection, and firing both
+     * concurrently (as a previous version did) may have been colliding. */
     mtu_exchange_params.func = mtu_exchange_cb;
     int mtu_err = bt_gatt_exchange_mtu(conn, &mtu_exchange_params);
     if (mtu_err) {
         LOG_ERR("joycon2: MTU exchange request failed (%d)", mtu_err);
+        /* No callback will ever fire in this case -- proceed directly. */
+        start_primary_discovery(conn);
     }
-
-    memset(&discover_params, 0, sizeof(discover_params));
-    discover_params.uuid = &joycon2_uuid_service.uuid;
-    discover_params.func = service_discovery_func;
-    discover_params.start_handle = 0x0001;
-    discover_params.end_handle = 0xffff;
-    discover_params.type = BT_GATT_DISCOVER_PRIMARY;
-
-    int rc = bt_gatt_discover(conn, &discover_params);
-    if (rc) {
-        LOG_ERR("joycon2: discover failed (%d)", rc);
-        zmk_joycon2_debug_print("JC2 DISCOVER FAILED");
-        return;
-    }
-
-    k_work_schedule(&discover_timeout_work, K_SECONDS(JOYCON2_DISCOVER_TIMEOUT_SEC));
 }
 
 static void jc_disconnected(struct bt_conn *conn, uint8_t reason) {
