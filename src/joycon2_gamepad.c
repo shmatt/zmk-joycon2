@@ -248,30 +248,79 @@ void zmk_joycon2_gamepad_set_connected_count(uint8_t count) {
     ZMK_JOYCON2_SEND_GAMEPAD_REPORT();
 }
 
-#define JOYCON2_STICK_CENTRE 2048
-/* Deadzone in raw 12-bit units. The sticks rest a little off centre and
- * jitter by a few counts; without this the host sees constant drift and a
- * report goes out for every input packet. */
-#define JOYCON2_STICK_DEADZONE 240
+/* Used until the controller's own calibration arrives. Deliberately a
+ * plausible deflection rather than the full 12-bit half-span: a stick only
+ * travels a fraction of the raw range, and assuming otherwise under-reports
+ * badly. */
+#define JOYCON2_STICK_DEFAULT_CENTRE 2048
+#define JOYCON2_STICK_DEFAULT_RANGE 1000
+
+/* Deadzone as a fraction of each axis's measured travel, so it scales with
+ * whatever range the controller reports. The sticks rest slightly off centre
+ * and jitter by a few counts; without this the host sees constant drift and
+ * a report goes out for every input packet. */
+#define JOYCON2_STICK_DEADZONE_NUM 1
+#define JOYCON2_STICK_DEADZONE_DEN 8
+
 /* Report only when an axis moves at least this far (in final int8 units),
  * so a resting-but-noisy stick doesn't flood the HID endpoint. */
 #define JOYCON2_AXIS_CHANGE_THRESHOLD 3
 
-static int8_t scale_axis(uint16_t raw) {
-    int32_t centred = (int32_t)raw - JOYCON2_STICK_CENTRE;
+static struct zmk_joycon2_stick_calib stick_calib[2] = {
+    [0] = {.center_x = JOYCON2_STICK_DEFAULT_CENTRE,
+           .center_y = JOYCON2_STICK_DEFAULT_CENTRE,
+           .max_x = JOYCON2_STICK_DEFAULT_RANGE,
+           .max_y = JOYCON2_STICK_DEFAULT_RANGE,
+           .min_x = JOYCON2_STICK_DEFAULT_RANGE,
+           .min_y = JOYCON2_STICK_DEFAULT_RANGE},
+    [1] = {.center_x = JOYCON2_STICK_DEFAULT_CENTRE,
+           .center_y = JOYCON2_STICK_DEFAULT_CENTRE,
+           .max_x = JOYCON2_STICK_DEFAULT_RANGE,
+           .max_y = JOYCON2_STICK_DEFAULT_RANGE,
+           .min_x = JOYCON2_STICK_DEFAULT_RANGE,
+           .min_y = JOYCON2_STICK_DEFAULT_RANGE},
+};
 
-    if (centred > -JOYCON2_STICK_DEADZONE && centred < JOYCON2_STICK_DEADZONE) {
+static size_t side_index(enum zmk_joycon2_side side) {
+    return side == ZMK_JOYCON2_SIDE_RIGHT ? 1 : 0;
+}
+
+void zmk_joycon2_gamepad_set_calibration(enum zmk_joycon2_side side,
+                                          const struct zmk_joycon2_stick_calib *calib) {
+    /* A zero range would divide by zero and, worse, silently peg the axis --
+     * keep the defaults if the read came back malformed. */
+    if (calib->max_x == 0 || calib->max_y == 0 || calib->min_x == 0 || calib->min_y == 0) {
+        LOG_WRN("joycon2: ignoring stick calibration with a zero range");
+        return;
+    }
+
+    stick_calib[side_index(side)] = *calib;
+    LOG_INF("joycon2: stick calibration centre=%u,%u max=%u,%u min=%u,%u", calib->center_x,
+            calib->center_y, calib->max_x, calib->max_y, calib->min_x, calib->min_y);
+}
+
+/* travel_pos/travel_neg are this axis's measured deflection either side of
+ * centre, so full tilt maps to full scale whatever the stick's actual span. */
+static int8_t scale_axis(uint16_t raw, uint16_t centre, uint16_t travel_pos, uint16_t travel_neg) {
+    int32_t centred = (int32_t)raw - (int32_t)centre;
+    int32_t travel = centred >= 0 ? travel_pos : travel_neg;
+    int32_t deadzone = (travel * JOYCON2_STICK_DEADZONE_NUM) / JOYCON2_STICK_DEADZONE_DEN;
+
+    if (centred > -deadzone && centred < deadzone) {
         return 0;
     }
 
-    /* Map the usable travel either side of the deadzone onto -127..127. */
+    /* Map the travel beyond the deadzone onto -127..127. */
     if (centred > 0) {
-        centred -= JOYCON2_STICK_DEADZONE;
+        centred -= deadzone;
     } else {
-        centred += JOYCON2_STICK_DEADZONE;
+        centred += deadzone;
     }
 
-    int32_t span = JOYCON2_STICK_CENTRE - JOYCON2_STICK_DEADZONE;
+    int32_t span = travel - deadzone;
+    if (span <= 0) {
+        return 0;
+    }
 
     return (int8_t)CLAMP((centred * 127) / span, -127, 127);
 }
@@ -282,9 +331,10 @@ void zmk_joycon2_gamepad_update(enum zmk_joycon2_side side, uint32_t buttons, ui
     struct joycon2_side_state *st = &side_state[side == ZMK_JOYCON2_SIDE_RIGHT ? 1 : 0];
     const struct joycon2_profile_map *map = map_for(side);
 
-    int8_t x = scale_axis(stick_x_raw);
+    const struct zmk_joycon2_stick_calib *cal = &stick_calib[side_index(side)];
+    int8_t x = scale_axis(stick_x_raw, cal->center_x, cal->max_x, cal->min_x);
     /* HID Y grows downwards, the stick's raw Y grows upwards. */
-    int8_t y = -scale_axis(stick_y_raw);
+    int8_t y = -scale_axis(stick_y_raw, cal->center_y, cal->max_y, cal->min_y);
 
     bool buttons_changed = !st->have_last || buttons != st->last_buttons;
     bool axes_changed = !st->have_last || abs(x - st->last_x) >= JOYCON2_AXIS_CHANGE_THRESHOLD ||

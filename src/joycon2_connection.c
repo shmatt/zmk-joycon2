@@ -67,6 +67,7 @@ enum handshake_step {
     HANDSHAKE_PAIRING_VIBRATION,
     HANDSHAKE_IMU_1,
     HANDSHAKE_IMU_2,
+    HANDSHAKE_READ_STICK_CALIB,
     HANDSHAKE_SUBSCRIBE_INPUT,
     /* Bonding runs last, after input is already streaming, so that if it
      * ever disturbs the stream the cause is unambiguous. It only affects
@@ -100,6 +101,9 @@ struct joycon2_ctrl {
      * reports must not suppress the other's. */
     bool have_last_buttons;
     uint32_t last_buttons;
+    /* Address of the outstanding memory read, so its reply can be told from
+     * the command ACKs that share the response characteristic. */
+    uint32_t pending_read_addr;
 };
 
 static struct joycon2_ctrl controllers[JOYCON2_MAX_CONTROLLERS];
@@ -238,6 +242,58 @@ static bool eir_parse_cb(struct bt_data *data, void *user_data) {
  * trevlars/switch2-controllers-linux's InputReport.parse. Reports are 63
  * bytes -- which needs ATT MTU >= 66, the reason nothing ever arrived
  * while the MTU sat at its 65-byte default. */
+/* Factory stick-calibration addresses in controller memory. Each half keeps
+ * its own stick's calibration at the address for the report field it uses. */
+#define JOYCON2_CALIB_ADDR_STICK_LEFT 0x000130A8
+#define JOYCON2_CALIB_ADDR_STICK_RIGHT 0x000130E8
+#define JOYCON2_CALIB_READ_LEN 0x0B
+
+/* A memory-read reply is the 8-byte command header, then the echoed length,
+ * three fixed bytes and the echoed address, and only then the data. */
+#define JOYCON2_READ_REPLY_ADDR_OFFSET 12
+#define JOYCON2_READ_REPLY_DATA_OFFSET 16
+
+/* 12-bit X and Y packed into three bytes, the same packing the sticks use. */
+static void unpack_xy(const uint8_t *d, uint16_t *x, uint16_t *y) {
+    *x = d[0] | ((uint16_t)(d[1] & 0x0F) << 8);
+    *y = (d[1] >> 4) | ((uint16_t)d[2] << 4);
+}
+
+/* Returns true if this response was our memory read rather than a command
+ * ACK, so the caller knows not to treat it as one. */
+static bool handle_memory_read_reply(struct joycon2_ctrl *c, const uint8_t *data,
+                                      uint16_t length) {
+    if (c->pending_read_addr == 0 || length < JOYCON2_READ_REPLY_DATA_OFFSET + 9) {
+        return false;
+    }
+    /* Command 0x02 is the memory read; anything else is an ACK. */
+    if (data[0] != 0x02) {
+        return false;
+    }
+    if (sys_get_le32(&data[JOYCON2_READ_REPLY_ADDR_OFFSET]) != c->pending_read_addr) {
+        return false;
+    }
+
+    const uint8_t *d = &data[JOYCON2_READ_REPLY_DATA_OFFSET];
+    struct zmk_joycon2_stick_calib calib;
+    /* Centre first, then the travel either side of it. */
+    unpack_xy(&d[0], &calib.center_x, &calib.center_y);
+    unpack_xy(&d[3], &calib.max_x, &calib.max_y);
+    unpack_xy(&d[6], &calib.min_x, &calib.min_y);
+
+    c->pending_read_addr = 0;
+
+#if IS_ENABLED(CONFIG_ZMK_JOYCON2_GAMEPAD)
+    zmk_joycon2_gamepad_set_calibration(c->side, &calib);
+#endif
+
+    char msg[80];
+    snprintf(msg, sizeof(msg), "JC2 CAL-%s c=%u,%u +%u,%u -%u,%u", side_tag(c->side),
+             calib.center_x, calib.center_y, calib.max_x, calib.max_y, calib.min_x, calib.min_y);
+    zmk_joycon2_debug_print(msg);
+    return true;
+}
+
 #define JOYCON2_REPORT_MIN_LEN 8
 #define JOYCON2_REPORT_BUTTONS_OFFSET 4
 #define JOYCON2_REPORT_BATTERY_OFFSET 0x1F
@@ -379,6 +435,11 @@ static uint8_t response_notify_func(struct bt_conn *conn, struct bt_gatt_subscri
         return BT_GATT_ITER_STOP;
     }
 
+    struct joycon2_ctrl *c = ctrl_for_params(params);
+    if (c != NULL && handle_memory_read_reply(c, data, length)) {
+        return BT_GATT_ITER_CONTINUE;
+    }
+
     hex_encode_and_print("JC2 ACK", data, length);
     return BT_GATT_ITER_CONTINUE;
 }
@@ -435,6 +496,23 @@ static void handshake_work_handler(struct k_work *work) {
                                        0x00, 0x00, 0xFF, 0x00, 0x00, 0x00};
         err = jc_write_command(c, cmd, sizeof(cmd));
         LOG_INF("joycon2: feature enable (%d)", err);
+        break;
+    }
+    case HANDSHAKE_READ_STICK_CALIB: {
+        /* Factory stick calibration, which every controller has. (There is
+         * also a user-calibration area, written when a stick is recalibrated
+         * on a console; these controllers have never seen one.) Each half
+         * stores its own stick's calibration at the address matching the
+         * report field it uses. */
+        uint32_t addr = (c->side == ZMK_JOYCON2_SIDE_RIGHT) ? JOYCON2_CALIB_ADDR_STICK_RIGHT
+                                                            : JOYCON2_CALIB_ADDR_STICK_LEFT;
+        uint8_t cmd[16] = {0x02, 0x91, 0x01, 0x04, 0x00, 0x08, 0x00, 0x00,
+                            JOYCON2_CALIB_READ_LEN, 0x7E, 0x00, 0x00};
+        sys_put_le32(addr, &cmd[12]);
+
+        c->pending_read_addr = addr;
+        err = jc_write_command(c, cmd, sizeof(cmd));
+        LOG_INF("joycon2: read stick calibration (%d)", err);
         break;
     }
     case HANDSHAKE_SUBSCRIBE_INPUT:
@@ -798,6 +876,7 @@ static void jc_disconnected(struct bt_conn *conn, uint8_t reason) {
     c->connecting = false;
     c->step = HANDSHAKE_DONE;
     c->have_last_buttons = false;
+    c->pending_read_addr = 0;
 
     char msg[48];
     snprintf(msg, sizeof(msg), "JC2 DISCONNECTED %s reason=0x%02x", side_tag(c->side), reason);

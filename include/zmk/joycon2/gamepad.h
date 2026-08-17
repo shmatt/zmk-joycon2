@@ -33,6 +33,25 @@ enum zmk_joycon2_profile {
     ZMK_JOYCON2_PROFILE_DUO,
 };
 
+/* A stick's measured range, read from the controller itself. max/min are
+ * offsets either side of centre, not absolute positions.
+ *
+ * This matters more than it looks: a Joy-Con stick only swings over a
+ * fraction of the raw 12-bit span, so scaling as though it used the whole
+ * range leaves the axes reporting roughly half of what they should at full
+ * tilt. */
+struct zmk_joycon2_stick_calib {
+    uint16_t center_x;
+    uint16_t center_y;
+    uint16_t max_x;
+    uint16_t max_y;
+    uint16_t min_x;
+    uint16_t min_y;
+};
+
+void zmk_joycon2_gamepad_set_calibration(enum zmk_joycon2_side side,
+                                          const struct zmk_joycon2_stick_calib *calib);
+
 /* Selects the mapping profile from how many controllers are currently
  * connected: 1 -> SOLO, 2 or more -> DUO. Safe to call on every
  * connect/disconnect; it only acts on a change. */
