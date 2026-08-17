@@ -4,6 +4,13 @@ config ZMK_JOYCON2
 
 if ZMK_JOYCON2
 
+config ZMK_JOYCON2_LEGACY_ENDPOINT_API
+    bool "Target a ZMK tree with the pre-rename endpoint API"
+    # The shmatt/zmk feat/mouse-keys-3.2 fork has zmk_endpoints_send_report()
+    # and friends; upstream ZMK renamed them to the singular
+    # zmk_endpoint_send_report(). Enable this when building against the fork.
+    default n
+
 config ZMK_JOYCON2_DEBUG_PRINT
     bool "HID debug-print helper (types debug text as keystrokes via the host HID connection)"
     default y

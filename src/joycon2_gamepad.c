@@ -25,6 +25,7 @@
 #include <zmk/hid.h>
 
 #include <zmk/joycon2/gamepad.h>
+#include <zmk/joycon2/zmk_compat.h>
 
 LOG_MODULE_REGISTER(joycon2_gamepad, CONFIG_ZMK_LOG_LEVEL);
 
@@ -197,7 +198,7 @@ void zmk_joycon2_gamepad_set_connected_count(uint8_t count) {
     /* Release everything so a button held under the old mapping can't
      * stay stuck down at a HID index the new mapping never touches. */
     zmk_hid_gamepad_clear();
-    zmk_endpoint_send_gamepad_report();
+    ZMK_JOYCON2_SEND_GAMEPAD_REPORT();
 }
 
 #define JOYCON2_STICK_CENTRE 2048
@@ -280,7 +281,7 @@ void zmk_joycon2_gamepad_update(enum zmk_joycon2_side side, uint32_t buttons, ui
     last_x = x;
     last_y = y;
 
-    int err = zmk_endpoint_send_gamepad_report();
+    int err = ZMK_JOYCON2_SEND_GAMEPAD_REPORT();
     if (err) {
         LOG_WRN("joycon2: gamepad report send failed (%d)", err);
     }

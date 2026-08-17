@@ -17,6 +17,7 @@
 #include <dt-bindings/zmk/modifiers.h>
 
 #include <zmk/joycon2/debug_print.h>
+#include <zmk/joycon2/zmk_compat.h>
 
 LOG_MODULE_REGISTER(joycon2_debug_print, CONFIG_ZMK_LOG_LEVEL);
 
@@ -154,7 +155,7 @@ static void joycon2_debug_print_work_handler(struct k_work *work) {
             zmk_hid_register_mods(MOD_LSFT);
         }
         zmk_hid_keyboard_press(cur_usage);
-        zmk_endpoint_send_report(HID_USAGE_KEY);
+        ZMK_JOYCON2_SEND_REPORT(HID_USAGE_KEY);
 
         print_phase = JOYCON2_DEBUG_PRINT_PHASE_RELEASE;
         k_work_schedule(&print_work, K_MSEC(JOYCON2_DEBUG_PRINT_STEP_DELAY_MS));
@@ -165,7 +166,7 @@ static void joycon2_debug_print_work_handler(struct k_work *work) {
     if (cur_shift) {
         zmk_hid_unregister_mods(MOD_LSFT);
     }
-    zmk_endpoint_send_report(HID_USAGE_KEY);
+    ZMK_JOYCON2_SEND_REPORT(HID_USAGE_KEY);
 
     print_pos++;
     if (print_pos >= print_len) {
