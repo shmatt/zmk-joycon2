@@ -327,6 +327,35 @@ static void handshake_work_handler(struct k_work *work) {
     k_work_schedule(&handshake_work, K_MSEC(JOYCON2_HANDSHAKE_STEP_DELAY_MS));
 }
 
+/* struct bt_gatt_subscribe_params.subscribe reports the CCC WRITE's actual
+ * ATT-level result -- separate from .notify, which only ever fires for
+ * real value notifications once subscribed. Never having set this means
+ * a silently-failed CCCD write on one specific characteristic (while
+ * others succeed) would look identical to "no data ever sent" -- exactly
+ * the symptom seen (RESPONSE notifies fine, INPUT never does). */
+static void subscribe_cb(struct bt_conn *conn, uint8_t err, struct bt_gatt_subscribe_params *params) {
+    ARG_UNUSED(conn);
+
+    const char *name = "?";
+    if (params == &input_subscribe_params) {
+        name = "IN";
+    } else if (params == &response_subscribe_params) {
+        name = "RESP";
+    } else if (params == &alt1_subscribe_params) {
+        name = "ALT1";
+    } else if (params == &alt2_subscribe_params) {
+        name = "ALT2";
+    } else if (params == &alt3_subscribe_params) {
+        name = "ALT3";
+    } else if (params == &alt4_subscribe_params) {
+        name = "ALT4";
+    }
+
+    char msg[48];
+    snprintf(msg, sizeof(msg), "JC2 CCC %s err=%u", name, err);
+    zmk_joycon2_debug_print(msg);
+}
+
 static void start_subscriptions(struct bt_conn *conn) {
     /* Explicit ccc_handle (rather than .disc_params) skips CCC
      * auto-discovery entirely -- that path also uses a READ_BY_TYPE-style
@@ -335,6 +364,7 @@ static void start_subscriptions(struct bt_conn *conn) {
     input_subscribe_params.value_handle = JOYCON2_INPUT_VALUE_HANDLE;
     input_subscribe_params.ccc_handle = JOYCON2_INPUT_CCC_HANDLE;
     input_subscribe_params.notify = input_notify_func;
+    input_subscribe_params.subscribe = subscribe_cb;
     input_subscribe_params.value = BT_GATT_CCC_NOTIFY;
     int err = bt_gatt_subscribe(conn, &input_subscribe_params);
     if (err && err != -EALREADY) {
@@ -345,6 +375,7 @@ static void start_subscriptions(struct bt_conn *conn) {
     response_subscribe_params.value_handle = JOYCON2_RESPONSE_VALUE_HANDLE;
     response_subscribe_params.ccc_handle = JOYCON2_RESPONSE_CCC_HANDLE;
     response_subscribe_params.notify = response_notify_func;
+    response_subscribe_params.subscribe = subscribe_cb;
     response_subscribe_params.value = BT_GATT_CCC_NOTIFY;
     err = bt_gatt_subscribe(conn, &response_subscribe_params);
     if (err && err != -EALREADY) {
@@ -355,24 +386,28 @@ static void start_subscriptions(struct bt_conn *conn) {
     alt1_subscribe_params.value_handle = JOYCON2_ALT1_VALUE_HANDLE;
     alt1_subscribe_params.ccc_handle = JOYCON2_ALT1_CCC_HANDLE;
     alt1_subscribe_params.notify = alt1_notify_func;
+    alt1_subscribe_params.subscribe = subscribe_cb;
     alt1_subscribe_params.value = BT_GATT_CCC_NOTIFY;
     bt_gatt_subscribe(conn, &alt1_subscribe_params);
 
     alt2_subscribe_params.value_handle = JOYCON2_ALT2_VALUE_HANDLE;
     alt2_subscribe_params.ccc_handle = JOYCON2_ALT2_CCC_HANDLE;
     alt2_subscribe_params.notify = alt2_notify_func;
+    alt2_subscribe_params.subscribe = subscribe_cb;
     alt2_subscribe_params.value = BT_GATT_CCC_NOTIFY;
     bt_gatt_subscribe(conn, &alt2_subscribe_params);
 
     alt3_subscribe_params.value_handle = JOYCON2_ALT3_VALUE_HANDLE;
     alt3_subscribe_params.ccc_handle = JOYCON2_ALT3_CCC_HANDLE;
     alt3_subscribe_params.notify = alt3_notify_func;
+    alt3_subscribe_params.subscribe = subscribe_cb;
     alt3_subscribe_params.value = BT_GATT_CCC_NOTIFY;
     bt_gatt_subscribe(conn, &alt3_subscribe_params);
 
     alt4_subscribe_params.value_handle = JOYCON2_ALT4_VALUE_HANDLE;
     alt4_subscribe_params.ccc_handle = JOYCON2_ALT4_CCC_HANDLE;
     alt4_subscribe_params.notify = alt4_notify_func;
+    alt4_subscribe_params.subscribe = subscribe_cb;
     alt4_subscribe_params.value = BT_GATT_CCC_NOTIFY;
     bt_gatt_subscribe(conn, &alt4_subscribe_params);
 
