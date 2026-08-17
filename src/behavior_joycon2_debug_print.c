@@ -15,10 +15,16 @@
 
 LOG_MODULE_DECLARE(joycon2_debug_print, CONFIG_ZMK_LOG_LEVEL);
 
-/* param1 selects which canned message to type; add more as later sub-stages need them. */
-static const char *const joycon2_debug_print_messages[] = {
-    "JOYCON2 DEBUG PRINT OK 12345",
-};
+/* param1 selects the action:
+ *   0 -- toggle per-input-report (button) logging
+ *   1 -- type a fixed self-test string
+ *
+ * 0 used to type the self-test string, which was the point during Stage 1;
+ * now that the decoder is proven, the useful thing to have on a combo is
+ * the logging toggle, since logging types into the focused window and has
+ * to be off to actually use the gamepad. */
+#define JOYCON2_DEBUG_ACTION_TOGGLE_INPUT_LOG 0
+#define JOYCON2_DEBUG_ACTION_SELF_TEST 1
 
 static int behavior_joycon2_debug_print_init(const struct device *dev) {
     ARG_UNUSED(dev);
@@ -29,12 +35,16 @@ static int on_keymap_binding_pressed(struct zmk_behavior_binding *binding,
                                       struct zmk_behavior_binding_event event) {
     ARG_UNUSED(event);
 
-    if (binding->param1 >= ARRAY_SIZE(joycon2_debug_print_messages)) {
-        LOG_WRN("no debug_print message at index %d", binding->param1);
+    switch (binding->param1) {
+    case JOYCON2_DEBUG_ACTION_TOGGLE_INPUT_LOG:
+        zmk_joycon2_debug_input_logging_toggle();
+        return 0;
+    case JOYCON2_DEBUG_ACTION_SELF_TEST:
+        return zmk_joycon2_debug_print("JOYCON2 DEBUG PRINT OK 12345");
+    default:
+        LOG_WRN("no debug_print action %d", binding->param1);
         return -ENOTSUP;
     }
-
-    return zmk_joycon2_debug_print(joycon2_debug_print_messages[binding->param1]);
 }
 
 static int on_keymap_binding_released(struct zmk_behavior_binding *binding,

@@ -223,3 +223,21 @@ static int joycon2_debug_print_init(void) {
 }
 
 SYS_INIT(joycon2_debug_print_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
+
+/* Off by default -- see the note in debug_print.h. */
+static bool input_logging_enabled;
+
+bool zmk_joycon2_debug_input_logging_enabled(void) { return input_logging_enabled; }
+
+void zmk_joycon2_debug_input_logging_toggle(void) {
+    if (input_logging_enabled) {
+        /* Announce before disabling, or the message would be suppressed by
+         * the very change it is reporting. */
+        zmk_joycon2_debug_print("JC2 BTNLOG OFF");
+        input_logging_enabled = false;
+        return;
+    }
+
+    input_logging_enabled = true;
+    zmk_joycon2_debug_print("JC2 BTNLOG ON");
+}

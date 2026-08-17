@@ -192,7 +192,9 @@ static const struct joycon2_button joycon2_buttons[] = {
 /* Reports stream at ~60-120Hz but the HID-typing debug channel manages
  * only a few characters per report period, so print on button-state
  * CHANGE only -- that is both what proves the decode and the only rate a
- * human-readable channel can sustain. */
+ * human-readable channel can sustain. Even then it is off unless input
+ * logging is toggled on, since typing into the focused window makes the
+ * gamepad unusable for actually playing anything. */
 static void decode_input_report(const uint8_t *data, uint16_t length) {
     static bool have_last;
     static uint32_t last_buttons;
@@ -219,6 +221,10 @@ static void decode_input_report(const uint8_t *data, uint16_t length) {
     }
     have_last = true;
     last_buttons = buttons;
+
+    if (!zmk_joycon2_debug_input_logging_enabled()) {
+        return;
+    }
 
     char msg[128];
     int n = snprintf(msg, sizeof(msg), "JC2 BTN");
@@ -271,7 +277,9 @@ static uint8_t response_notify_func(struct bt_conn *conn, struct bt_gatt_subscri
         return BT_GATT_ITER_STOP;
     }
 
-    hex_encode_and_print("JC2 ACK", data, length);
+    if (zmk_joycon2_debug_input_logging_enabled()) {
+        hex_encode_and_print("JC2 ACK", data, length);
+    }
     return BT_GATT_ITER_CONTINUE;
 }
 
@@ -354,6 +362,12 @@ static void subscribe_cb(struct bt_conn *conn, uint8_t err, struct bt_gatt_subsc
         name = "RESP";
     }
 
+    /* A failing CCC write is worth reporting even when quiet, since it
+     * means no data will ever arrive; a successful one is just noise. */
+    if (err == 0 && !zmk_joycon2_debug_input_logging_enabled()) {
+        return;
+    }
+
     char msg[48];
     snprintf(msg, sizeof(msg), "JC2 CCC %s err=%u", name, err);
     zmk_joycon2_debug_print(msg);
@@ -397,7 +411,9 @@ static void start_subscriptions(struct bt_conn *conn) {
         zmk_joycon2_debug_print("JC2 RESPONSE SUBSCRIBE FAILED");
     }
 
-    zmk_joycon2_debug_print("JC2 SUBSCRIBED");
+    if (zmk_joycon2_debug_input_logging_enabled()) {
+        zmk_joycon2_debug_print("JC2 SUBSCRIBED");
+    }
     /* start_handshake resets handshake_step -- without it a reconnect
      * would find the step still at HANDSHAKE_DONE and never handshake. */
     start_handshake();
@@ -417,12 +433,17 @@ static void mtu_exchange_cb(struct bt_conn *conn, uint8_t err,
     if (err) {
         LOG_ERR("joycon2: MTU exchange failed (err %u)", err);
         snprintf(msg, sizeof(msg), "JC2 MTU EXCHANGE FAILED %u", err);
+        zmk_joycon2_debug_print(msg);
     } else {
         uint16_t mtu = bt_gatt_get_mtu(conn);
         LOG_INF("joycon2: MTU exchange succeeded, ATT MTU=%u", mtu);
-        snprintf(msg, sizeof(msg), "JC2 MTU=%u", mtu);
+        /* An MTU below 66 cannot carry a 63-byte input report, so it is
+         * worth shouting about regardless of the quiet setting. */
+        if (mtu < 66 || zmk_joycon2_debug_input_logging_enabled()) {
+            snprintf(msg, sizeof(msg), "JC2 MTU=%u", mtu);
+            zmk_joycon2_debug_print(msg);
+        }
     }
-    zmk_joycon2_debug_print(msg);
 
     start_subscriptions(conn);
 }
@@ -594,6 +615,10 @@ static void jc_le_data_len_updated(struct bt_conn *conn, struct bt_conn_le_data_
      * 27 = no DLE, 251 = full). A 62-byte input report needs 70 bytes
      * on-air, and the hypothesis is Nintendo's input hot path refuses
      * to fragment across 27-byte PDUs. */
+    if (!zmk_joycon2_debug_input_logging_enabled()) {
+        return;
+    }
+
     char msg[48];
     snprintf(msg, sizeof(msg), "JC2 DLE tx=%u rx=%u", info->tx_max_len, info->rx_max_len);
     zmk_joycon2_debug_print(msg);
