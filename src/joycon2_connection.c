@@ -48,6 +48,22 @@ LOG_MODULE_REGISTER(joycon2_connection, CONFIG_ZMK_LOG_LEVEL);
 #define JOYCON2_RESPONSE_VALUE_HANDLE 0x001a
 #define JOYCON2_RESPONSE_CCC_HANDLE 0x001b
 
+/* The handshake completed successfully (confirmed via structured ACKs on
+ * RESPONSE), but no data ever arrived on INPUT even after pressing
+ * buttons. Subscribing to every other notify-capable characteristic in
+ * the service too, to find out which one (if any) actually carries live
+ * button/stick state -- the two "groups" of notify characteristics seen
+ * during manual nRF Connect exploration (grouped by shared vendor
+ * descriptor UUID) may carry different kinds of data. */
+#define JOYCON2_ALT1_VALUE_HANDLE 0x000e /* d5a9e01e-2ffc-4cca-b20c-8b67142bf442 */
+#define JOYCON2_ALT1_CCC_HANDLE 0x000f
+#define JOYCON2_ALT2_VALUE_HANDLE 0x001e /* 640ca58e-0e88-410c-a7f3-426faf2b690b */
+#define JOYCON2_ALT2_CCC_HANDLE 0x001f
+#define JOYCON2_ALT3_VALUE_HANDLE 0x0022 /* d3bd69d2-841c-4241-ab15-f86f406d2a80 */
+#define JOYCON2_ALT3_CCC_HANDLE 0x0023
+#define JOYCON2_ALT4_VALUE_HANDLE 0x0026 /* ab7de9be-89fe-49ad-828f-118f09df7fde */
+#define JOYCON2_ALT4_CCC_HANDLE 0x0027
+
 #define JOYCON2_SCAN_TIMEOUT_SEC 20
 #define JOYCON2_CONNECT_TIMEOUT_SEC 15
 #define JOYCON2_HANDSHAKE_STEP_DELAY_MS 500
@@ -58,6 +74,10 @@ static bool jc_connecting;
 
 static struct bt_gatt_subscribe_params input_subscribe_params;
 static struct bt_gatt_subscribe_params response_subscribe_params;
+static struct bt_gatt_subscribe_params alt1_subscribe_params;
+static struct bt_gatt_subscribe_params alt2_subscribe_params;
+static struct bt_gatt_subscribe_params alt3_subscribe_params;
+static struct bt_gatt_subscribe_params alt4_subscribe_params;
 static struct bt_gatt_exchange_params mtu_exchange_params;
 
 static struct k_work_delayable scan_timeout_work;
@@ -67,6 +87,7 @@ static struct k_work_delayable handshake_work;
 enum handshake_step {
     HANDSHAKE_IMU_1,
     HANDSHAKE_IMU_2,
+    HANDSHAKE_LED,
     HANDSHAKE_MAC_1,
     HANDSHAKE_MAC_2,
     HANDSHAKE_MAC_3,
@@ -148,6 +169,23 @@ static uint8_t response_notify_func(struct bt_conn *conn, struct bt_gatt_subscri
     return BT_GATT_ITER_CONTINUE;
 }
 
+#define JOYCON2_ALT_NOTIFY_FUNC(name, prefix)                                                     \
+    static uint8_t name(struct bt_conn *conn, struct bt_gatt_subscribe_params *params,             \
+                         const void *data, uint16_t length) {                                      \
+        ARG_UNUSED(conn);                                                                           \
+        if (!data) {                                                                                \
+            params->value_handle = 0;                                                               \
+            return BT_GATT_ITER_STOP;                                                               \
+        }                                                                                            \
+        hex_encode_and_print(prefix, data, length);                                                 \
+        return BT_GATT_ITER_CONTINUE;                                                               \
+    }
+
+JOYCON2_ALT_NOTIFY_FUNC(alt1_notify_func, "JC2 ALT1")
+JOYCON2_ALT_NOTIFY_FUNC(alt2_notify_func, "JC2 ALT2")
+JOYCON2_ALT_NOTIFY_FUNC(alt3_notify_func, "JC2 ALT3")
+JOYCON2_ALT_NOTIFY_FUNC(alt4_notify_func, "JC2 ALT4")
+
 static int jc_write_command(const uint8_t *data, size_t len) {
     if (jc_conn == NULL) {
         return -ENOTCONN;
@@ -179,6 +217,21 @@ static void handshake_work_handler(struct k_work *work) {
                                        0x00, 0x00, 0xFF, 0x00, 0x00, 0x00};
         err = jc_write_command(cmd, sizeof(cmd));
         LOG_INF("joycon2: IMU enable step2 (%d)", err);
+        break;
+    }
+    case HANDSHAKE_LED: {
+        /* JoyCon2Mac sends this unconditionally right after IMU-enable,
+         * before MAC-binding even starts, and treats it as part of
+         * declaring the connection established -- our handshake was
+         * missing it entirely, which is the likely reason the player LEDs
+         * never left "searching" mode despite every other step succeeding.
+         * ledMask 0x01 = Left/player-1-style pattern (JoyCon2Mac's
+         * default for a Left-side controller; exact player number doesn't
+         * matter for proving the LEDs react at all). */
+        static const uint8_t cmd[] = {0x09, 0x91, 0x01, 0x07, 0x00, 0x08, 0x00, 0x00,
+                                       0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+        err = jc_write_command(cmd, sizeof(cmd));
+        LOG_INF("joycon2: set player LED (%d)", err);
         break;
     }
     case HANDSHAKE_MAC_1: {
@@ -276,6 +329,30 @@ static void start_subscriptions(struct bt_conn *conn) {
         LOG_ERR("joycon2: response subscribe failed (%d)", err);
         zmk_joycon2_debug_print("JC2 RESPONSE SUBSCRIBE FAILED");
     }
+
+    alt1_subscribe_params.value_handle = JOYCON2_ALT1_VALUE_HANDLE;
+    alt1_subscribe_params.ccc_handle = JOYCON2_ALT1_CCC_HANDLE;
+    alt1_subscribe_params.notify = alt1_notify_func;
+    alt1_subscribe_params.value = BT_GATT_CCC_NOTIFY;
+    bt_gatt_subscribe(conn, &alt1_subscribe_params);
+
+    alt2_subscribe_params.value_handle = JOYCON2_ALT2_VALUE_HANDLE;
+    alt2_subscribe_params.ccc_handle = JOYCON2_ALT2_CCC_HANDLE;
+    alt2_subscribe_params.notify = alt2_notify_func;
+    alt2_subscribe_params.value = BT_GATT_CCC_NOTIFY;
+    bt_gatt_subscribe(conn, &alt2_subscribe_params);
+
+    alt3_subscribe_params.value_handle = JOYCON2_ALT3_VALUE_HANDLE;
+    alt3_subscribe_params.ccc_handle = JOYCON2_ALT3_CCC_HANDLE;
+    alt3_subscribe_params.notify = alt3_notify_func;
+    alt3_subscribe_params.value = BT_GATT_CCC_NOTIFY;
+    bt_gatt_subscribe(conn, &alt3_subscribe_params);
+
+    alt4_subscribe_params.value_handle = JOYCON2_ALT4_VALUE_HANDLE;
+    alt4_subscribe_params.ccc_handle = JOYCON2_ALT4_CCC_HANDLE;
+    alt4_subscribe_params.notify = alt4_notify_func;
+    alt4_subscribe_params.value = BT_GATT_CCC_NOTIFY;
+    bt_gatt_subscribe(conn, &alt4_subscribe_params);
 
     zmk_joycon2_debug_print("JC2 SUBSCRIBED");
     k_work_schedule(&handshake_work, K_MSEC(JOYCON2_SUBSCRIBE_TO_HANDSHAKE_DELAY_MS));
