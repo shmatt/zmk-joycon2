@@ -3,11 +3,17 @@
  *
  * SPDX-License-Identifier: MIT
  *
- * Bridges decoded Joy-Con 2 state onto a gamepad HID report sent to the
- * host. ZMK's own HID report descriptor is a static const array in its
- * app headers and cannot be extended from an out-of-tree module, so the
- * gamepad is exposed by zmk-hid-io, which registers a second, independent
- * HID-over-GATT service declaring a Generic Desktop Joystick.
+ * Bridges decoded Joy-Con 2 state onto the gamepad HID report that ZMK
+ * sends to the host (CONFIG_ZMK_GAMEPAD -- report ID 4 inside ZMK's own
+ * single HID interface).
+ *
+ * An earlier attempt used zmk-hid-io, which registers a SECOND
+ * HID-over-GATT service. That broke BLE HID on Android outright: the
+ * keyboard stopped pairing entirely while USB still worked. Two HIDS
+ * primary services in one GATT database is evidently more than Android's
+ * HID host accepts. Adding a report to the existing service is both the
+ * conventional way composite HID devices work and the way ZMK already
+ * carries keyboard, consumer and mouse together.
  */
 
 #include <stdlib.h>
@@ -15,8 +21,8 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
-#include <zmk/hid-io/endpoints.h>
-#include <zmk/hid-io/hid_joystick.h>
+#include <zmk/endpoints.h>
+#include <zmk/hid.h>
 
 #include <zmk/joycon2/gamepad.h>
 
@@ -51,10 +57,9 @@ LOG_MODULE_REGISTER(joycon2_gamepad, CONFIG_ZMK_LOG_LEVEL);
 #define JC2_GR 0x01000000U
 #define JC2_GL 0x02000000U
 
-/* Our zmk-hid-io fork widens the joystick report to 32 buttons (upstream
- * has 8, too few for a two-Joy-Con pad). Indices below are 0-based; a
+/* Matches ZMK_HID_GAMEPAD_NUM_BUTTONS. Indices below are 0-based; a
  * gamepad tester shows them as buttons 1-32. */
-#define JOYCON2_GAMEPAD_NUM_BUTTONS 32
+#define JOYCON2_GAMEPAD_NUM_BUTTONS ZMK_HID_GAMEPAD_NUM_BUTTONS
 
 /* Logical slots, laid out so DUO and either SOLO half all land on the same
  * indices -- a game configured against one profile keeps working in the
@@ -191,8 +196,8 @@ void zmk_joycon2_gamepad_set_connected_count(uint8_t count) {
 
     /* Release everything so a button held under the old mapping can't
      * stay stuck down at a HID index the new mapping never touches. */
-    zmk_hid_joy2_clear();
-    zmk_endpoints_send_joystick_report_alt();
+    zmk_hid_gamepad_clear();
+    zmk_endpoint_send_gamepad_report();
 }
 
 #define JOYCON2_STICK_CENTRE 2048
@@ -260,24 +265,22 @@ void zmk_joycon2_gamepad_update(enum zmk_joycon2_side side, uint32_t buttons, ui
                 continue;
             }
             if (now_pressed) {
-                zmk_hid_joy2_button_press(i);
+                zmk_hid_gamepad_button_press(i);
             } else {
-                zmk_hid_joy2_button_release(i);
+                zmk_hid_gamepad_button_release(i);
             }
         }
     }
 
-    /* movement_set replaces the axis values outright rather than
-     * accumulating deltas like a mouse, which is what an absolute stick
-     * position needs. */
-    zmk_hid_joy2_movement_set(x, y);
+    /* Absolute stick position, not a mouse-style delta. */
+    zmk_hid_gamepad_left_stick_set(x, y);
 
     have_last = true;
     last_buttons = buttons;
     last_x = x;
     last_y = y;
 
-    int err = zmk_endpoints_send_joystick_report_alt();
+    int err = zmk_endpoint_send_gamepad_report();
     if (err) {
         LOG_WRN("joycon2: gamepad report send failed (%d)", err);
     }

@@ -154,7 +154,7 @@ static void joycon2_debug_print_work_handler(struct k_work *work) {
             zmk_hid_register_mods(MOD_LSFT);
         }
         zmk_hid_keyboard_press(cur_usage);
-        zmk_endpoints_send_report(HID_USAGE_KEY);
+        zmk_endpoint_send_report(HID_USAGE_KEY);
 
         print_phase = JOYCON2_DEBUG_PRINT_PHASE_RELEASE;
         k_work_schedule(&print_work, K_MSEC(JOYCON2_DEBUG_PRINT_STEP_DELAY_MS));
@@ -165,7 +165,7 @@ static void joycon2_debug_print_work_handler(struct k_work *work) {
     if (cur_shift) {
         zmk_hid_unregister_mods(MOD_LSFT);
     }
-    zmk_endpoints_send_report(HID_USAGE_KEY);
+    zmk_endpoint_send_report(HID_USAGE_KEY);
 
     print_pos++;
     if (print_pos >= print_len) {
