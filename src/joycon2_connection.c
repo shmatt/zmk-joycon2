@@ -163,7 +163,12 @@ static bool eir_parse_cb(struct bt_data *data, void *user_data) {
 #define JOYCON2_REPORT_MIN_LEN 8
 #define JOYCON2_REPORT_BUTTONS_OFFSET 4
 #define JOYCON2_REPORT_BATTERY_OFFSET 0x1F
+/* Each half reports its own stick in its own field, and leaves the other
+ * field at a constant 0x7FF (dead centre). Reading the wrong one gives a
+ * stick that never moves -- which is exactly what a right Joy-Con did while
+ * this always read the left field. */
 #define JOYCON2_REPORT_LEFT_STICK_OFFSET 10
+#define JOYCON2_REPORT_RIGHT_STICK_OFFSET 13
 
 /* The top three bits of the button word are always set on this hardware
  * (some always-on status flags, not buttons) -- mask to the documented
@@ -208,10 +213,14 @@ static void decode_input_report(const uint8_t *data, uint16_t length) {
 #if IS_ENABLED(CONFIG_ZMK_JOYCON2_GAMEPAD)
     /* Runs for every report, not just on button change, so stick movement
      * is continuous; it does its own change detection and rate limiting. */
-    if (length >= JOYCON2_REPORT_LEFT_STICK_OFFSET + 3) {
-        const uint8_t *s = &data[JOYCON2_REPORT_LEFT_STICK_OFFSET];
-        uint16_t stick_x = s[0] | ((uint16_t)(s[1] & 0x0F) << 8);
-        uint16_t stick_y = (s[1] >> 4) | ((uint16_t)s[2] << 4);
+    uint16_t stick_offset = (jc_side == ZMK_JOYCON2_SIDE_RIGHT)
+                                ? JOYCON2_REPORT_RIGHT_STICK_OFFSET
+                                : JOYCON2_REPORT_LEFT_STICK_OFFSET;
+    if (length >= stick_offset + 3) {
+        /* 12-bit X and Y packed into three bytes. */
+        const uint8_t *st = &data[stick_offset];
+        uint16_t stick_x = st[0] | ((uint16_t)(st[1] & 0x0F) << 8);
+        uint16_t stick_y = (st[1] >> 4) | ((uint16_t)st[2] << 4);
         zmk_joycon2_gamepad_update(jc_side, buttons, stick_x, stick_y);
     }
 #endif

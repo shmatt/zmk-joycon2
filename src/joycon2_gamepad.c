@@ -62,31 +62,42 @@ LOG_MODULE_REGISTER(joycon2_gamepad, CONFIG_ZMK_LOG_LEVEL);
  * gamepad tester shows them as buttons 1-32. */
 #define JOYCON2_GAMEPAD_NUM_BUTTONS ZMK_HID_GAMEPAD_NUM_BUTTONS
 
-/* Logical slots, laid out so DUO and either SOLO half all land on the same
- * indices -- a game configured against one profile keeps working in the
- * others as far as the shared controls allow. */
+/* Logical slots.
+ *
+ * The index values are NOT consecutive, and that matters: Android maps HID
+ * button N to a fixed keycode sequence which contains two slots nothing
+ * uses, so packing buttons consecutively shifts everything after the face
+ * cluster onto the wrong keycodes.
+ *
+ *   HID button:  1  2  3  4  5  6  7   8   9   10  11      12      13     14      15
+ *   Android:     A  B  C  X  Y  Z  L1  R1  L2  R2  ThumbL  ThumbR  Start  Select  Mode
+ *
+ * BUTTON_C (3) and BUTTON_Z (6) are vestigial and no app reads them, so the
+ * four face buttons are 1, 2, 4, 5 -- skipping 3 -- and the shoulders start
+ * at 7. Values below are 0-based, so index = HID button - 1.
+ */
 enum joycon2_pad_button {
-    PAD_FACE_DOWN = 0, /* A / Cross      */
-    PAD_FACE_RIGHT,    /* B / Circle     */
-    PAD_FACE_LEFT,     /* X / Square     */
-    PAD_FACE_UP,       /* Y / Triangle   */
-    PAD_L1,
-    PAD_L2,
-    PAD_R1,
-    PAD_R2,
-    PAD_SELECT, /* Minus  */
-    PAD_START,  /* Plus   */
-    PAD_L3,     /* Left stick click  */
-    PAD_R3,     /* Right stick click */
-    PAD_HOME,
-    PAD_CAPTURE,
-    /* A real D-pad, separate from the face cluster. Only DUO uses these:
-     * in SOLO the single half's D-pad (or ABXY) has to serve as the face
-     * cluster, since there is no second half to provide one. */
-    PAD_DPAD_UP,
-    PAD_DPAD_DOWN,
-    PAD_DPAD_LEFT,
-    PAD_DPAD_RIGHT,
+    PAD_FACE_DOWN = 0, /* A      */
+    PAD_FACE_RIGHT = 1, /* B      */
+    PAD_FACE_LEFT = 3,  /* X      */
+    PAD_FACE_UP = 4,    /* Y      */
+    PAD_L1 = 6,
+    PAD_R1 = 7,
+    PAD_L2 = 8,
+    PAD_R2 = 9,
+    PAD_THUMBL = 10,
+    PAD_THUMBR = 11,
+    PAD_START = 12,
+    PAD_SELECT = 13,
+    PAD_MODE = 14,
+    /* Past Mode, Android exposes BUTTON_1..16 (keycodes 188+), which are not
+     * D-pad keycodes. A proper D-pad needs a hat switch in the report
+     * descriptor; until then DUO's D-pad lands on these generic slots, which
+     * apps can at least bind individually. */
+    PAD_GENERIC_1 = 15,
+    PAD_GENERIC_2 = 16,
+    PAD_GENERIC_3 = 17,
+    PAD_GENERIC_4 = 18,
 };
 
 /* Index = HID button number - 1. 0 means "nothing mapped at this index". */
@@ -96,65 +107,67 @@ struct joycon2_profile_map {
 
 /* SOLO: a single Joy-Con held UPRIGHT in one hand.
  *
- * The half's own shoulder pair keeps its natural side (the left half's
- * L/ZL really are L1/L2), and the rail buttons stand in for the pair the
- * missing half would have provided -- so on the left half SL/SR become
- * R1/R2, and on the right half they become L1/L2. No stick rotation,
- * since the controller is not turned.
+ * Its own shoulder pair keeps its natural side, and the rail buttons stand
+ * in for the pair the missing half would have provided -- so on the right
+ * half SR/SL become L1/L2, and on the left half they become R1/R2. The
+ * half's single stick acts as the left stick, so its click is ThumbL.
  */
 static const struct joycon2_profile_map solo_left = {
     .buttons =
         {
+            /* The D-pad serves as the face cluster: there is no second half
+             * to provide one, and it sits under the thumb. Positions match
+             * the face buttons they stand in for. */
             [PAD_FACE_DOWN] = JC2_DOWN,
             [PAD_FACE_RIGHT] = JC2_RIGHT,
             [PAD_FACE_LEFT] = JC2_LEFT,
             [PAD_FACE_UP] = JC2_UP,
             [PAD_L1] = JC2_L,
             [PAD_L2] = JC2_ZL,
-            [PAD_R1] = JC2_SL_L,
-            [PAD_R2] = JC2_SR_L,
-            [PAD_SELECT] = JC2_MINUS,
-            [PAD_L3] = JC2_LSTK,
-            [PAD_CAPTURE] = JC2_CAPTURE,
+            [PAD_R1] = JC2_SR_L,
+            [PAD_R2] = JC2_SL_L,
+            [PAD_THUMBL] = JC2_LSTK,
+            [PAD_START] = JC2_MINUS,
+            [PAD_SELECT] = JC2_CAPTURE,
         },
 };
 
 static const struct joycon2_profile_map solo_right = {
     .buttons =
         {
+            /* Nintendo's face buttons by position, not by letter: Nintendo B
+             * is the bottom button so it becomes A, Nintendo A is on the
+             * right so it becomes B, and likewise Y->X and X->Y. */
             [PAD_FACE_DOWN] = JC2_B,
             [PAD_FACE_RIGHT] = JC2_A,
             [PAD_FACE_LEFT] = JC2_Y,
             [PAD_FACE_UP] = JC2_X,
-            [PAD_L1] = JC2_SL_R,
-            [PAD_L2] = JC2_SR_R,
+            [PAD_L1] = JC2_SR_R,
+            [PAD_L2] = JC2_SL_R,
             [PAD_R1] = JC2_R,
             [PAD_R2] = JC2_ZR,
+            [PAD_THUMBL] = JC2_RSTK,
             [PAD_START] = JC2_PLUS,
-            [PAD_R3] = JC2_RSTK,
-            [PAD_HOME] = JC2_HOME,
+            [PAD_SELECT] = JC2_C,
+            [PAD_MODE] = JC2_HOME,
         },
 };
 
 /* DUO: both halves held upright as one pad, so every control keeps its
- * natural role. The two tables map disjoint physical buttons, and each
- * half only ever writes its own indices, so the host sees one merged pad.
- * The rail buttons are left unmapped here -- both real shoulder pairs are
- * present, so SL/SR are free for future remapping. */
+ * natural role. The two tables map disjoint physical buttons and each half
+ * only writes its own indices, so the host sees one merged pad. The rail
+ * buttons are free here, since both real shoulder pairs are present. */
 static const struct joycon2_profile_map duo_left = {
     .buttons =
         {
             [PAD_L1] = JC2_L,
             [PAD_L2] = JC2_ZL,
+            [PAD_THUMBL] = JC2_LSTK,
             [PAD_SELECT] = JC2_MINUS,
-            [PAD_L3] = JC2_LSTK,
-            [PAD_CAPTURE] = JC2_CAPTURE,
-            /* A true D-pad here, distinct from the face cluster that the
-             * right half contributes in this profile. */
-            [PAD_DPAD_UP] = JC2_UP,
-            [PAD_DPAD_DOWN] = JC2_DOWN,
-            [PAD_DPAD_LEFT] = JC2_LEFT,
-            [PAD_DPAD_RIGHT] = JC2_RIGHT,
+            [PAD_GENERIC_1] = JC2_UP,
+            [PAD_GENERIC_2] = JC2_DOWN,
+            [PAD_GENERIC_3] = JC2_LEFT,
+            [PAD_GENERIC_4] = JC2_RIGHT,
         },
 };
 
@@ -167,9 +180,9 @@ static const struct joycon2_profile_map duo_right = {
             [PAD_FACE_UP] = JC2_X,
             [PAD_R1] = JC2_R,
             [PAD_R2] = JC2_ZR,
+            [PAD_THUMBR] = JC2_RSTK,
             [PAD_START] = JC2_PLUS,
-            [PAD_R3] = JC2_RSTK,
-            [PAD_HOME] = JC2_HOME,
+            [PAD_MODE] = JC2_HOME,
         },
 };
 
@@ -273,8 +286,14 @@ void zmk_joycon2_gamepad_update(enum zmk_joycon2_side side, uint32_t buttons, ui
         }
     }
 
-    /* Absolute stick position, not a mouse-style delta. */
-    zmk_hid_gamepad_left_stick_set(x, y);
+    /* Absolute stick position, not a mouse-style delta. A lone Joy-Con is
+     * the left stick whichever half it is; paired up, each half drives its
+     * own side. */
+    if (current_profile == ZMK_JOYCON2_PROFILE_DUO && side == ZMK_JOYCON2_SIDE_RIGHT) {
+        zmk_hid_gamepad_right_stick_set(x, y);
+    } else {
+        zmk_hid_gamepad_left_stick_set(x, y);
+    }
 
     have_last = true;
     last_buttons = buttons;
