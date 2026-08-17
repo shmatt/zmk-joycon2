@@ -49,6 +49,8 @@ struct zmk_joycon2_stick_calib {
     uint16_t min_y;
 };
 
+/* Ignores implausible values and keeps the defaults, so a controller whose
+ * calibration region is unwritten does not end up with a pegged stick. */
 void zmk_joycon2_gamepad_set_calibration(enum zmk_joycon2_side side,
                                           const struct zmk_joycon2_stick_calib *calib);
 

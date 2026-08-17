@@ -104,6 +104,7 @@ struct joycon2_ctrl {
     /* Address of the outstanding memory read, so its reply can be told from
      * the command ACKs that share the response characteristic. */
     uint32_t pending_read_addr;
+    bool calib_alt_tried;
 };
 
 static struct joycon2_ctrl controllers[JOYCON2_MAX_CONTROLLERS];
@@ -259,6 +260,27 @@ static void unpack_xy(const uint8_t *d, uint16_t *x, uint16_t *y) {
     *y = (d[1] >> 4) | ((uint16_t)d[2] << 4);
 }
 
+/* Each half stores its stick's calibration at one of these two addresses.
+ * The obvious guess -- right half at the "stick 2" address -- turned out to
+ * be wrong on a real right Joy-Con, which returned erased flash there, so
+ * the other address is tried before giving up. */
+static uint32_t stick_calib_addr(enum zmk_joycon2_side side, bool alternate) {
+    bool right = (side == ZMK_JOYCON2_SIDE_RIGHT) != alternate;
+    return right ? JOYCON2_CALIB_ADDR_STICK_RIGHT : JOYCON2_CALIB_ADDR_STICK_LEFT;
+}
+
+static int jc_write_command(struct joycon2_ctrl *c, const uint8_t *data, size_t len);
+
+static void read_stick_calibration(struct joycon2_ctrl *c, uint32_t addr) {
+    uint8_t cmd[16] = {0x02, 0x91, 0x01, 0x04, 0x00, 0x08, 0x00, 0x00,
+                        JOYCON2_CALIB_READ_LEN, 0x7E, 0x00, 0x00};
+    sys_put_le32(addr, &cmd[12]);
+
+    c->pending_read_addr = addr;
+    int err = jc_write_command(c, cmd, sizeof(cmd));
+    LOG_INF("joycon2: read stick calibration at %08x (%d)", addr, err);
+}
+
 /* Returns true if this response was our memory read rather than a command
  * ACK, so the caller knows not to treat it as one. */
 static bool handle_memory_read_reply(struct joycon2_ctrl *c, const uint8_t *data,
@@ -282,6 +304,17 @@ static bool handle_memory_read_reply(struct joycon2_ctrl *c, const uint8_t *data
     unpack_xy(&d[6], &calib.min_x, &calib.min_y);
 
     c->pending_read_addr = 0;
+
+    /* Erased flash reads as all-ones. Seen on a real right Joy-Con at the
+     * address the reference implied, so try the other one before settling
+     * for defaults. */
+    bool erased = (calib.center_x == 0x0FFF && calib.center_y == 0x0FFF);
+    if (erased && !c->calib_alt_tried) {
+        c->calib_alt_tried = true;
+        zmk_joycon2_debug_print("JC2 CAL RETRY");
+        read_stick_calibration(c, stick_calib_addr(c->side, true));
+        return true;
+    }
 
 #if IS_ENABLED(CONFIG_ZMK_JOYCON2_GAMEPAD)
     zmk_joycon2_gamepad_set_calibration(c->side, &calib);
@@ -499,20 +532,7 @@ static void handshake_work_handler(struct k_work *work) {
         break;
     }
     case HANDSHAKE_READ_STICK_CALIB: {
-        /* Factory stick calibration, which every controller has. (There is
-         * also a user-calibration area, written when a stick is recalibrated
-         * on a console; these controllers have never seen one.) Each half
-         * stores its own stick's calibration at the address matching the
-         * report field it uses. */
-        uint32_t addr = (c->side == ZMK_JOYCON2_SIDE_RIGHT) ? JOYCON2_CALIB_ADDR_STICK_RIGHT
-                                                            : JOYCON2_CALIB_ADDR_STICK_LEFT;
-        uint8_t cmd[16] = {0x02, 0x91, 0x01, 0x04, 0x00, 0x08, 0x00, 0x00,
-                            JOYCON2_CALIB_READ_LEN, 0x7E, 0x00, 0x00};
-        sys_put_le32(addr, &cmd[12]);
-
-        c->pending_read_addr = addr;
-        err = jc_write_command(c, cmd, sizeof(cmd));
-        LOG_INF("joycon2: read stick calibration (%d)", err);
+        read_stick_calibration(c, stick_calib_addr(c->side, false));
         break;
     }
     case HANDSHAKE_SUBSCRIBE_INPUT:
@@ -877,6 +897,7 @@ static void jc_disconnected(struct bt_conn *conn, uint8_t reason) {
     c->step = HANDSHAKE_DONE;
     c->have_last_buttons = false;
     c->pending_read_addr = 0;
+    c->calib_alt_tried = false;
 
     char msg[48];
     snprintf(msg, sizeof(msg), "JC2 DISCONNECTED %s reason=0x%02x", side_tag(c->side), reason);

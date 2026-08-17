@@ -253,7 +253,17 @@ void zmk_joycon2_gamepad_set_connected_count(uint8_t count) {
  * travels a fraction of the raw range, and assuming otherwise under-reports
  * badly. */
 #define JOYCON2_STICK_DEFAULT_CENTRE 2048
-#define JOYCON2_STICK_DEFAULT_RANGE 1000
+/* Measured on a real left stick, which read centre ~2050 and travel ~1200. */
+#define JOYCON2_STICK_DEFAULT_RANGE 1200
+
+/* A stick's centre must sit near the middle of the 12-bit span and its travel
+ * must be a believable fraction of it. Erased flash reads as 0xFFF, which
+ * without this check is taken as centre 4095 and pegs both axes hard over --
+ * seen on a controller whose calibration region was unwritten. */
+#define JOYCON2_CAL_CENTRE_MIN 1024
+#define JOYCON2_CAL_CENTRE_MAX 3072
+#define JOYCON2_CAL_TRAVEL_MIN 200
+#define JOYCON2_CAL_TRAVEL_MAX 2048
 
 /* Deadzone as a fraction of each axis's measured travel, so it scales with
  * whatever range the controller reports. The sticks rest slightly off centre
@@ -287,10 +297,13 @@ static size_t side_index(enum zmk_joycon2_side side) {
 
 void zmk_joycon2_gamepad_set_calibration(enum zmk_joycon2_side side,
                                           const struct zmk_joycon2_stick_calib *calib) {
-    /* A zero range would divide by zero and, worse, silently peg the axis --
-     * keep the defaults if the read came back malformed. */
-    if (calib->max_x == 0 || calib->max_y == 0 || calib->min_x == 0 || calib->min_y == 0) {
-        LOG_WRN("joycon2: ignoring stick calibration with a zero range");
+    if (!IN_RANGE(calib->center_x, JOYCON2_CAL_CENTRE_MIN, JOYCON2_CAL_CENTRE_MAX) ||
+        !IN_RANGE(calib->center_y, JOYCON2_CAL_CENTRE_MIN, JOYCON2_CAL_CENTRE_MAX) ||
+        !IN_RANGE(calib->max_x, JOYCON2_CAL_TRAVEL_MIN, JOYCON2_CAL_TRAVEL_MAX) ||
+        !IN_RANGE(calib->max_y, JOYCON2_CAL_TRAVEL_MIN, JOYCON2_CAL_TRAVEL_MAX) ||
+        !IN_RANGE(calib->min_x, JOYCON2_CAL_TRAVEL_MIN, JOYCON2_CAL_TRAVEL_MAX) ||
+        !IN_RANGE(calib->min_y, JOYCON2_CAL_TRAVEL_MIN, JOYCON2_CAL_TRAVEL_MAX)) {
+        LOG_WRN("joycon2: implausible stick calibration, keeping defaults");
         return;
     }
 
