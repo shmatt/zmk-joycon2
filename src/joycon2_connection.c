@@ -19,48 +19,49 @@
 #include <zephyr/bluetooth/gap.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/hci.h>
-#include <zephyr/bluetooth/uuid.h>
 
 #include <zmk/joycon2/connection.h>
 #include <zmk/joycon2/debug_print.h>
 
 LOG_MODULE_REGISTER(joycon2_connection, CONFIG_ZMK_LOG_LEVEL);
 
-/* GATT layout confirmed by hand via nRF Connect against a real Joy-Con 2,
- * cross-checked against github.com/OZORDI/JoyCon2Mac's BLEManager.mm (which
- * uses the identical UUIDs). These are only visible via discovery *after*
- * connecting -- the device's advertisement carries no service UUID at all,
- * so the scan filter below matches on manufacturer data instead (see
- * JOYCON2_NINTENDO_COMPANY_ID below). */
-#define JOYCON2_UUID_SERVICE_VAL BT_UUID_128_ENCODE(0xab7de9be, 0x89fe, 0x49ad, 0x828f, 0x118f09df7fd0)
-#define JOYCON2_UUID_INPUT_VAL BT_UUID_128_ENCODE(0xab7de9be, 0x89fe, 0x49ad, 0x828f, 0x118f09df7fd2)
-#define JOYCON2_UUID_COMMAND_VAL BT_UUID_128_ENCODE(0x649d4ac9, 0x8eb7, 0x4e6c, 0xaf44, 0x1ea54fe5f005)
-#define JOYCON2_UUID_RESPONSE_VAL BT_UUID_128_ENCODE(0xc765a961, 0xd9d8, 0x4d36, 0xa20a, 0x5315b111836a)
-
-static const struct bt_uuid_128 joycon2_uuid_service = BT_UUID_INIT_128(JOYCON2_UUID_SERVICE_VAL);
-static const struct bt_uuid_128 joycon2_uuid_input = BT_UUID_INIT_128(JOYCON2_UUID_INPUT_VAL);
-static const struct bt_uuid_128 joycon2_uuid_command = BT_UUID_INIT_128(JOYCON2_UUID_COMMAND_VAL);
-static const struct bt_uuid_128 joycon2_uuid_response = BT_UUID_INIT_128(JOYCON2_UUID_RESPONSE_VAL);
+/* Exact ATT handles recovered via `adb shell dumpsys bluetooth_manager`'s
+ * cached GATT database, from a successful Android/nRF Connect discovery
+ * against a real Joy-Con 2 (see project notes). GATT discovery
+ * (ATT_READ_BY_TYPE / ATT_READ_BY_GROUP_TYPE -- i.e. anything that
+ * enumerates rather than looks up one specific thing) never gets a
+ * response from this device's firmware, in every configuration tried
+ * (full/scoped handle ranges, targeted/broad service lookup, slow/fast
+ * connection interval, with/without MTU exchange, with/without an
+ * inter-request delay) -- yet Android fully enumerates this same device in
+ * under a second. Root cause unresolved; hardcoding the handles sidesteps
+ * the entire class of problem rather than continuing to chase it.
+ *
+ * Caveat: these handles are almost certainly NOT portable across Joy-Con 2
+ * firmware revisions or units -- a real fix (or a scan-time
+ * re-verification step) is needed before this can be part of the eventual
+ * shareable Stage 2 module.
+ */
+#define JOYCON2_INPUT_VALUE_HANDLE 0x000a
+#define JOYCON2_INPUT_CCC_HANDLE 0x000b
+#define JOYCON2_COMMAND_VALUE_HANDLE 0x0014
+#define JOYCON2_RESPONSE_VALUE_HANDLE 0x001a
+#define JOYCON2_RESPONSE_CCC_HANDLE 0x001b
 
 #define JOYCON2_SCAN_TIMEOUT_SEC 20
 #define JOYCON2_CONNECT_TIMEOUT_SEC 15
-#define JOYCON2_DISCOVER_TIMEOUT_SEC 10
 #define JOYCON2_HANDSHAKE_STEP_DELAY_MS 500
+#define JOYCON2_SUBSCRIBE_TO_HANDSHAKE_DELAY_MS 500
 
 static struct bt_conn *jc_conn;
 static bool jc_connecting;
-static uint16_t command_value_handle;
 
-static struct bt_gatt_discover_params discover_params;
-static struct bt_gatt_discover_params input_ccc_disc_params;
-static struct bt_gatt_discover_params response_ccc_disc_params;
 static struct bt_gatt_subscribe_params input_subscribe_params;
 static struct bt_gatt_subscribe_params response_subscribe_params;
 static struct bt_gatt_exchange_params mtu_exchange_params;
 
 static struct k_work_delayable scan_timeout_work;
 static struct k_work_delayable connect_timeout_work;
-static struct k_work_delayable discover_timeout_work;
 static struct k_work_delayable handshake_work;
 
 enum handshake_step {
@@ -74,9 +75,6 @@ enum handshake_step {
 };
 
 static enum handshake_step handshake_step;
-
-static uint8_t service_discovery_func(struct bt_conn *conn, const struct bt_gatt_attr *attr,
-                                       struct bt_gatt_discover_params *params);
 
 static void hex_encode_and_print(const char *prefix, const uint8_t *data, uint16_t length) {
     char msg[128];
@@ -117,40 +115,6 @@ static bool eir_parse_cb(struct bt_data *data, void *user_data) {
     return true;
 }
 
-static void start_primary_discovery(struct bt_conn *conn) {
-    memset(&discover_params, 0, sizeof(discover_params));
-    discover_params.uuid = &joycon2_uuid_service.uuid;
-    discover_params.func = service_discovery_func;
-    discover_params.start_handle = 0x0001;
-    discover_params.end_handle = 0xffff;
-    discover_params.type = BT_GATT_DISCOVER_PRIMARY;
-
-    int rc = bt_gatt_discover(conn, &discover_params);
-    if (rc) {
-        LOG_ERR("joycon2: discover failed (%d)", rc);
-        zmk_joycon2_debug_print("JC2 DISCOVER FAILED");
-        return;
-    }
-
-    k_work_schedule(&discover_timeout_work, K_SECONDS(JOYCON2_DISCOVER_TIMEOUT_SEC));
-}
-
-static void mtu_exchange_cb(struct bt_conn *conn, uint8_t err,
-                             struct bt_gatt_exchange_params *params) {
-    ARG_UNUSED(params);
-
-    if (err) {
-        LOG_ERR("joycon2: MTU exchange failed (err %u)", err);
-    } else {
-        LOG_INF("joycon2: MTU exchange succeeded, ATT MTU=%u", bt_gatt_get_mtu(conn));
-    }
-
-    /* ATT only allows one outstanding request at a time per connection --
-     * wait for this to actually complete (success or failure) before
-     * starting discovery, rather than firing both concurrently as before. */
-    start_primary_discovery(conn);
-}
-
 static void start_handshake(void) {
     handshake_step = HANDSHAKE_IMU_1;
     k_work_schedule(&handshake_work, K_MSEC(JOYCON2_HANDSHAKE_STEP_DELAY_MS));
@@ -184,131 +148,14 @@ static uint8_t response_notify_func(struct bt_conn *conn, struct bt_gatt_subscri
     return BT_GATT_ITER_CONTINUE;
 }
 
-static uint8_t chrc_discovery_func(struct bt_conn *conn, const struct bt_gatt_attr *attr,
-                                    struct bt_gatt_discover_params *params) {
-    ARG_UNUSED(conn);
-
-    if (!attr) {
-        LOG_INF("joycon2: characteristic discovery complete");
-        k_work_cancel_delayable(&discover_timeout_work);
-        memset(params, 0, sizeof(*params));
-
-        char msg[64];
-        snprintf(msg, sizeof(msg), "JC2 CHRC in=%u cmd=%u resp=%u",
-                 input_subscribe_params.value_handle, command_value_handle,
-                 response_subscribe_params.value_handle);
-        zmk_joycon2_debug_print(msg);
-
-        if (command_value_handle) {
-            start_handshake();
-        }
-        return BT_GATT_ITER_STOP;
-    }
-
-    struct bt_gatt_chrc *chrc = attr->user_data;
-
-    if (bt_uuid_cmp(chrc->uuid, &joycon2_uuid_input.uuid) == 0) {
-        input_subscribe_params.value_handle = bt_gatt_attr_value_handle(attr);
-        input_subscribe_params.notify = input_notify_func;
-        input_subscribe_params.value = BT_GATT_CCC_NOTIFY;
-        input_subscribe_params.disc_params = &input_ccc_disc_params;
-        input_subscribe_params.end_handle = discover_params.end_handle;
-        int err = bt_gatt_subscribe(conn, &input_subscribe_params);
-        if (err && err != -EALREADY) {
-            LOG_ERR("joycon2: input subscribe failed (%d)", err);
-        }
-    } else if (bt_uuid_cmp(chrc->uuid, &joycon2_uuid_command.uuid) == 0) {
-        command_value_handle = bt_gatt_attr_value_handle(attr);
-    } else if (bt_uuid_cmp(chrc->uuid, &joycon2_uuid_response.uuid) == 0) {
-        response_subscribe_params.value_handle = bt_gatt_attr_value_handle(attr);
-        response_subscribe_params.notify = response_notify_func;
-        response_subscribe_params.value = BT_GATT_CCC_NOTIFY;
-        response_subscribe_params.disc_params = &response_ccc_disc_params;
-        response_subscribe_params.end_handle = discover_params.end_handle;
-        int err = bt_gatt_subscribe(conn, &response_subscribe_params);
-        if (err && err != -EALREADY) {
-            LOG_ERR("joycon2: response subscribe failed (%d)", err);
-        }
-    }
-
-    return BT_GATT_ITER_CONTINUE;
-}
-
-static uint16_t pending_chrc_start_handle;
-static uint16_t pending_chrc_end_handle;
-static struct k_work_delayable start_chrc_discover_work;
-
-#define JOYCON2_CHRC_DISCOVER_DELAY_MS 500
-
-static void start_chrc_discover_work_handler(struct k_work *work) {
-    ARG_UNUSED(work);
-
-    if (jc_conn == NULL) {
-        return;
-    }
-
-    memset(&discover_params, 0, sizeof(discover_params));
-    discover_params.uuid = NULL;
-    discover_params.func = chrc_discovery_func;
-    discover_params.start_handle = pending_chrc_start_handle;
-    discover_params.end_handle = pending_chrc_end_handle;
-    discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
-
-    int err = bt_gatt_discover(jc_conn, &discover_params);
-    if (err) {
-        LOG_ERR("joycon2: chrc discover failed (%d)", err);
-        zmk_joycon2_debug_print("JC2 CHRC DISCOVER FAILED");
-        return;
-    }
-
-    k_work_schedule(&discover_timeout_work, K_SECONDS(JOYCON2_DISCOVER_TIMEOUT_SEC));
-}
-
-static uint8_t service_discovery_func(struct bt_conn *conn, const struct bt_gatt_attr *attr,
-                                       struct bt_gatt_discover_params *params) {
-    ARG_UNUSED(conn);
-    ARG_UNUSED(params);
-
-    if (!attr) {
-        LOG_ERR("joycon2: service not found");
-        zmk_joycon2_debug_print("JC2 SERVICE NOT FOUND");
-        memset(&discover_params, 0, sizeof(discover_params));
-        return BT_GATT_ITER_STOP;
-    }
-
-    /* Reverted to a targeted UUID-filtered lookup (ATT_FIND_BY_TYPE_VALUE)
-     * -- this reliably worked repeatedly; "discover all services"
-     * (ATT_READ_BY_GROUP_TYPE) never got any response. Characteristic
-     * discovery (ATT_READ_BY_TYPE) also never gets a response, in every
-     * variant tried (full range, scoped range, slow and fast connection
-     * interval) -- yet Android's nRF Connect DID fully enumerate this same
-     * device using (presumably) the same standard ATT operations, and did
-     * so in under a second. The one thing never yet tried: my code always
-     * chains characteristic discovery immediately, synchronously, off the
-     * primary-discovery-complete callback, with zero gap. Testing whether
-     * this device's firmware needs a short breather between consecutive
-     * GATT transactions that a naive back-to-back client doesn't give it. */
-    k_work_cancel_delayable(&discover_timeout_work);
-
-    struct bt_gatt_service_val *service_val = attr->user_data;
-    pending_chrc_start_handle = attr->handle + 1;
-    pending_chrc_end_handle = service_val->end_handle;
-
-    LOG_INF("joycon2: service found, discovering characteristics");
-    zmk_joycon2_debug_print("JC2 SERVICE FOUND");
-
-    k_work_schedule(&start_chrc_discover_work, K_MSEC(JOYCON2_CHRC_DISCOVER_DELAY_MS));
-    return BT_GATT_ITER_STOP;
-}
-
 static int jc_write_command(const uint8_t *data, size_t len) {
-    if (jc_conn == NULL || command_value_handle == 0) {
+    if (jc_conn == NULL) {
         return -ENOTCONN;
     }
     /* sign=false: this controller flatly rejects standard BLE bonding (no
      * CSRK is ever established), unlike ZMK's own split link which is
      * bonded and can use signed writes. */
-    return bt_gatt_write_without_response(jc_conn, command_value_handle, data, len, false);
+    return bt_gatt_write_without_response(jc_conn, JOYCON2_COMMAND_VALUE_HANDLE, data, len, false);
 }
 
 static void handshake_work_handler(struct k_work *work) {
@@ -405,6 +252,48 @@ static void handshake_work_handler(struct k_work *work) {
     k_work_schedule(&handshake_work, K_MSEC(JOYCON2_HANDSHAKE_STEP_DELAY_MS));
 }
 
+static void start_subscriptions(struct bt_conn *conn) {
+    /* Explicit ccc_handle (rather than .disc_params) skips CCC
+     * auto-discovery entirely -- that path also uses a READ_BY_TYPE-style
+     * op internally and would likely hit the same wall as characteristic
+     * discovery did. */
+    input_subscribe_params.value_handle = JOYCON2_INPUT_VALUE_HANDLE;
+    input_subscribe_params.ccc_handle = JOYCON2_INPUT_CCC_HANDLE;
+    input_subscribe_params.notify = input_notify_func;
+    input_subscribe_params.value = BT_GATT_CCC_NOTIFY;
+    int err = bt_gatt_subscribe(conn, &input_subscribe_params);
+    if (err && err != -EALREADY) {
+        LOG_ERR("joycon2: input subscribe failed (%d)", err);
+        zmk_joycon2_debug_print("JC2 INPUT SUBSCRIBE FAILED");
+    }
+
+    response_subscribe_params.value_handle = JOYCON2_RESPONSE_VALUE_HANDLE;
+    response_subscribe_params.ccc_handle = JOYCON2_RESPONSE_CCC_HANDLE;
+    response_subscribe_params.notify = response_notify_func;
+    response_subscribe_params.value = BT_GATT_CCC_NOTIFY;
+    err = bt_gatt_subscribe(conn, &response_subscribe_params);
+    if (err && err != -EALREADY) {
+        LOG_ERR("joycon2: response subscribe failed (%d)", err);
+        zmk_joycon2_debug_print("JC2 RESPONSE SUBSCRIBE FAILED");
+    }
+
+    zmk_joycon2_debug_print("JC2 SUBSCRIBED");
+    k_work_schedule(&handshake_work, K_MSEC(JOYCON2_SUBSCRIBE_TO_HANDSHAKE_DELAY_MS));
+}
+
+static void mtu_exchange_cb(struct bt_conn *conn, uint8_t err,
+                             struct bt_gatt_exchange_params *params) {
+    ARG_UNUSED(params);
+
+    if (err) {
+        LOG_ERR("joycon2: MTU exchange failed (err %u)", err);
+    } else {
+        LOG_INF("joycon2: MTU exchange succeeded, ATT MTU=%u", bt_gatt_get_mtu(conn));
+    }
+
+    start_subscriptions(conn);
+}
+
 static void scan_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
                         struct net_buf_simple *ad) {
     ARG_UNUSED(rssi);
@@ -435,13 +324,7 @@ static void scan_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
     bt_le_scan_stop();
     k_work_cancel_delayable(&scan_timeout_work);
 
-    /* 0x0006 = 7.5ms, the fastest interval BLE allows -- matches what
-     * Android's own BLE stack (nRF Connect) negotiated with this exact
-     * device in a session where full GATT enumeration worked. Previously
-     * requested 30-50ms; testing whether this device's firmware has tight
-     * timing margins for preparing enumeration-style responses. Timeout
-     * 500*10ms=5000ms also matches Android's observed supervision timeout. */
-    struct bt_le_conn_param *param = BT_LE_CONN_PARAM(0x0006, 0x0006, 0, 500);
+    struct bt_le_conn_param *param = BT_LE_CONN_PARAM(0x0018, 0x0028, 0, 400);
     int err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN, param, &jc_conn);
     if (err) {
         LOG_ERR("joycon2: create conn failed (%d)", err);
@@ -468,18 +351,6 @@ static void scan_timeout_work_handler(struct k_work *work) {
     bt_le_scan_stop();
     zmk_joycon2_debug_print("JC2 SCAN TIMEOUT NOT FOUND");
     jc_connecting = false;
-}
-
-static void discover_timeout_work_handler(struct k_work *work) {
-    ARG_UNUSED(work);
-
-    if (jc_conn == NULL) {
-        return;
-    }
-
-    LOG_ERR("joycon2: discovery timed out");
-    memset(&discover_params, 0, sizeof(discover_params));
-    zmk_joycon2_debug_print("JC2 DISCOVER TIMEOUT");
 }
 
 static void connect_timeout_work_handler(struct k_work *work) {
@@ -513,21 +384,20 @@ static void jc_connected(struct bt_conn *conn, uint8_t err) {
         return;
     }
 
-    LOG_INF("joycon2: connected, discovering service");
+    LOG_INF("joycon2: connected, subscribing");
     zmk_joycon2_debug_print("JC2 CONNECTED");
+    jc_connecting = false;
 
-    /* Not required for discovery to work, but the default 23-byte ATT MTU
-     * would truncate longer input-report notifications later, and no
-     * known-working client against this device skips it. Discovery starts
-     * from mtu_exchange_cb once this actually completes -- ATT only allows
-     * one outstanding request at a time per connection, and firing both
-     * concurrently (as a previous version did) may have been colliding. */
+    /* Not required before subscribing works, but the default 23-byte ATT
+     * MTU would truncate longer input-report notifications later, and no
+     * known-working client against this device skips it. Subscriptions
+     * start from mtu_exchange_cb once this actually completes. */
     mtu_exchange_params.func = mtu_exchange_cb;
     int mtu_err = bt_gatt_exchange_mtu(conn, &mtu_exchange_params);
     if (mtu_err) {
         LOG_ERR("joycon2: MTU exchange request failed (%d)", mtu_err);
         /* No callback will ever fire in this case -- proceed directly. */
-        start_primary_discovery(conn);
+        start_subscriptions(conn);
     }
 }
 
@@ -538,13 +408,10 @@ static void jc_disconnected(struct bt_conn *conn, uint8_t reason) {
 
     LOG_INF("joycon2: disconnected (reason %d)", reason);
     k_work_cancel_delayable(&connect_timeout_work);
-    k_work_cancel_delayable(&discover_timeout_work);
-    k_work_cancel_delayable(&start_chrc_discover_work);
+    k_work_cancel_delayable(&handshake_work);
     bt_conn_unref(jc_conn);
     jc_conn = NULL;
     jc_connecting = false;
-    command_value_handle = 0;
-    k_work_cancel_delayable(&handshake_work);
 
     char msg[48];
     snprintf(msg, sizeof(msg), "JC2 DISCONNECTED reason=0x%02x", reason);
@@ -567,7 +434,6 @@ int zmk_joycon2_connection_start(void) {
         jc_conn = NULL;
     }
 
-    command_value_handle = 0;
     jc_connecting = true;
 
     /* Immediate feedback that the combo registered at all, decoupled from
@@ -595,8 +461,6 @@ int zmk_joycon2_connection_start(void) {
 static int joycon2_connection_init(void) {
     k_work_init_delayable(&scan_timeout_work, scan_timeout_work_handler);
     k_work_init_delayable(&connect_timeout_work, connect_timeout_work_handler);
-    k_work_init_delayable(&discover_timeout_work, discover_timeout_work_handler);
-    k_work_init_delayable(&start_chrc_discover_work, start_chrc_discover_work_handler);
     k_work_init_delayable(&handshake_work, handshake_work_handler);
     bt_conn_cb_register(&jc_conn_callbacks);
     return 0;
