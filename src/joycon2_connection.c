@@ -11,6 +11,7 @@
 #include <zephyr/init.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/byteorder.h>
 
 #include <zephyr/bluetooth/addr.h>
 #include <zephyr/bluetooth/bluetooth.h>
@@ -76,6 +77,14 @@ static void hex_encode_and_print(const char *prefix, const uint8_t *data, uint16
     zmk_joycon2_debug_print(msg);
 }
 
+/* Nintendo's Bluetooth SIG company identifier (little-endian in the AD
+ * payload: 53 05). The Joy-Con 2's advertisement carries only Flags +
+ * Manufacturer Specific Data -- confirmed by capturing its raw AD bytes via
+ * nRF Connect (0201061BFF53050100037E0566200001000000000000000F...) -- no
+ * service UUID list is broadcast at all, so filtering on the GATT service
+ * UUID (only discoverable post-connection) never matches. */
+#define JOYCON2_NINTENDO_COMPANY_ID 0x0553
+
 struct eir_parse_ctx {
     bool found;
 };
@@ -83,20 +92,17 @@ struct eir_parse_ctx {
 static bool eir_parse_cb(struct bt_data *data, void *user_data) {
     struct eir_parse_ctx *ctx = user_data;
 
-    if (data->type != BT_DATA_UUID128_SOME && data->type != BT_DATA_UUID128_ALL) {
+    if (data->type != BT_DATA_MANUFACTURER_DATA) {
         return true;
     }
-    if (data->data_len % 16 != 0) {
+    if (data->data_len < 2) {
         return true;
     }
 
-    for (int i = 0; i < data->data_len; i += 16) {
-        struct bt_uuid_128 uuid;
-        bt_uuid_create(&uuid.uuid, &data->data[i], 16);
-        if (bt_uuid_cmp(&uuid.uuid, &joycon2_uuid_service.uuid) == 0) {
-            ctx->found = true;
-            return false;
-        }
+    uint16_t company_id = sys_get_le16(data->data);
+    if (company_id == JOYCON2_NINTENDO_COMPANY_ID) {
+        ctx->found = true;
+        return false;
     }
     return true;
 }
@@ -427,6 +433,11 @@ int zmk_joycon2_connection_start(void) {
 
     command_value_handle = 0;
     jc_connecting = true;
+
+    /* Immediate feedback that the combo registered at all, decoupled from
+     * whatever the scan eventually finds (which can take up to
+     * JOYCON2_SCAN_TIMEOUT_SEC to resolve one way or the other). */
+    zmk_joycon2_debug_print("JC2 SCANNING");
 
     int err = bt_le_scan_start(BT_LE_SCAN_PASSIVE, scan_found);
     if (err) {
