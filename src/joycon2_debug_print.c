@@ -118,7 +118,10 @@ static void joycon2_debug_print_work_handler(struct k_work *work) {
         }
 
         if (cur_shift) {
-            zmk_hid_register_mod(MOD_LSFT);
+            /* zmk_hid_register_mod() takes a bit *index* (0-7), not the
+             * pre-shifted MOD_* bitmask -- zmk_hid_register_mods() is the
+             * bitmask-taking variant and does the index conversion itself. */
+            zmk_hid_register_mods(MOD_LSFT);
         }
         zmk_hid_keyboard_press(cur_usage);
         zmk_endpoints_send_report(HID_USAGE_KEY);
@@ -130,7 +133,7 @@ static void joycon2_debug_print_work_handler(struct k_work *work) {
 
     zmk_hid_keyboard_release(cur_usage);
     if (cur_shift) {
-        zmk_hid_unregister_mod(MOD_LSFT);
+        zmk_hid_unregister_mods(MOD_LSFT);
     }
     zmk_endpoints_send_report(HID_USAGE_KEY);
 
