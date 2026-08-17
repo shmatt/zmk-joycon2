@@ -9,5 +9,10 @@
             compatible = "zmk,behavior-joycon2-central-test";
             #binding-cells = <0>;
         };
+
+        joycon2_connect: joycon2_connect {
+            compatible = "zmk,behavior-joycon2-connect";
+            #binding-cells = <0>;
+        };
     };
 };

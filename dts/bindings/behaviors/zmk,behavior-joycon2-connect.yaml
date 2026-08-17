@@ -1,0 +1,10 @@
+description: |
+  Joy-Con 2 project Stage 1 sub-stage 4 behavior. When pressed, scans for a
+  real Joy-Con 2 (filtered by its BLE service UUID), connects, discovers its
+  GATT characteristics, subscribes to input/response notifications, runs the
+  IMU-enable + MAC-binding command handshake, then relays raw input
+  notification payloads as hex via the debug-print helper.
+
+compatible: "zmk,behavior-joycon2-connect"
+
+include: zero_param.yaml
