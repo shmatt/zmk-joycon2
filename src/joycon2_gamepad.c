@@ -83,6 +83,11 @@ enum joycon2_pad_button {
     PAD_FACE_RIGHT = 1, /* B      */
     PAD_FACE_LEFT = 3,  /* X      */
     PAD_FACE_UP = 4,    /* Y      */
+    /* BUTTON_C and BUTTON_Z are vestigial: no ordinary game reads them,
+     * which makes them the safe place to put bindings for a specific app,
+     * since nothing standard can collide with them. */
+    PAD_C = 2,
+    PAD_Z = 5,
     PAD_L1 = 6,
     PAD_R1 = 7,
     PAD_L2 = 8,
@@ -171,7 +176,11 @@ static const struct joycon2_profile_map duo_left = {
         {
             [PAD_L1] = JC2_L,
             [PAD_L2] = JC2_ZL,
-            [PAD_SELECT] = JC2_MINUS,
+            /* Minus goes to the app-usable Z rather than Select, by request:
+             * it is reachable but ignored by ordinary games. Capture takes
+             * Select in its place. */
+            [PAD_Z] = JC2_MINUS,
+            [PAD_SELECT] = JC2_CAPTURE,
             [PAD_THUMBL] = JC2_LSTK,
             [PAD_GENERIC_1] = JC2_UP,
             [PAD_GENERIC_2] = JC2_DOWN,
@@ -192,6 +201,9 @@ static const struct joycon2_profile_map duo_right = {
             [PAD_START] = JC2_PLUS,
             [PAD_MODE] = JC2_HOME,
             [PAD_THUMBR] = JC2_RSTK,
+            /* The other app-usable spare, and a natural home for the
+             * physical C button. */
+            [PAD_C] = JC2_C,
         },
 };
 
