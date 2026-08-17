@@ -16,13 +16,17 @@ enum zmk_joycon2_side {
 
 /* Button mapping profile.
  *
- * SOLO: a single Joy-Con used on its own, held sideways -- the rail
- * (SL/SR) becomes the shoulder buttons, the D-pad (left half) or face
- * buttons (right half) become the face cluster, and the stick is rotated
- * to match the rotated grip.
+ * SOLO: a single Joy-Con used on its own, held UPRIGHT in one hand. Its
+ * own shoulder pair keeps its natural side (the left half's L/ZL really
+ * are L1/L2) and the rail buttons stand in for the pair the missing half
+ * would have provided -- so SL/SR become R1/R2 on the left half and
+ * L1/L2 on the right. The half's D-pad (left) or ABXY cluster (right)
+ * serves as the face buttons, since there is no second half to supply
+ * one.
  *
  * DUO: both halves used together as one pad, each held upright, so every
- * control keeps its natural orientation and no rotation is applied.
+ * control keeps its natural role: the right half provides the face
+ * cluster and R1/R2, the left half a true D-pad and L1/L2.
  */
 enum zmk_joycon2_profile {
     ZMK_JOYCON2_PROFILE_SOLO = 0,
