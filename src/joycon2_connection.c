@@ -208,8 +208,39 @@ static uint8_t chrc_discovery_func(struct bt_conn *conn, const struct bt_gatt_at
     return BT_GATT_ITER_CONTINUE;
 }
 
+static uint16_t pending_chrc_start_handle;
+static uint16_t pending_chrc_end_handle;
+static struct k_work_delayable start_chrc_discover_work;
+
+#define JOYCON2_CHRC_DISCOVER_DELAY_MS 500
+
+static void start_chrc_discover_work_handler(struct k_work *work) {
+    ARG_UNUSED(work);
+
+    if (jc_conn == NULL) {
+        return;
+    }
+
+    memset(&discover_params, 0, sizeof(discover_params));
+    discover_params.uuid = NULL;
+    discover_params.func = chrc_discovery_func;
+    discover_params.start_handle = pending_chrc_start_handle;
+    discover_params.end_handle = pending_chrc_end_handle;
+    discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
+
+    int err = bt_gatt_discover(jc_conn, &discover_params);
+    if (err) {
+        LOG_ERR("joycon2: chrc discover failed (%d)", err);
+        zmk_joycon2_debug_print("JC2 CHRC DISCOVER FAILED");
+        return;
+    }
+
+    k_work_schedule(&discover_timeout_work, K_SECONDS(JOYCON2_DISCOVER_TIMEOUT_SEC));
+}
+
 static uint8_t service_discovery_func(struct bt_conn *conn, const struct bt_gatt_attr *attr,
                                        struct bt_gatt_discover_params *params) {
+    ARG_UNUSED(conn);
     ARG_UNUSED(params);
 
     if (!attr) {
@@ -219,43 +250,28 @@ static uint8_t service_discovery_func(struct bt_conn *conn, const struct bt_gatt
         return BT_GATT_ITER_STOP;
     }
 
-    /* Reverting to a targeted UUID-filtered lookup (ATT_FIND_BY_TYPE_VALUE)
-     * -- this reliably worked twice; switching to "discover all services"
-     * (ATT_READ_BY_GROUP_TYPE) made things WORSE (this call never got a
-     * response at all). Combined with characteristic discovery
-     * (ATT_READ_BY_TYPE) also never getting a response, the pattern is:
-     * this device answers FIND_BY_TYPE_VALUE reliably but not
-     * READ_BY_TYPE/READ_BY_GROUP_TYPE -- yet Android's nRF Connect *did*
-     * fully enumerate this same device using (presumably) the same
-     * standard ATT operations. The one concrete difference spotted in that
-     * working session's own connection log: Android negotiated a much
-     * faster interval (7.5ms) than we request below -- worth testing
-     * whether this device's firmware has tight timing margins for
-     * preparing enumeration-style responses. */
+    /* Reverted to a targeted UUID-filtered lookup (ATT_FIND_BY_TYPE_VALUE)
+     * -- this reliably worked repeatedly; "discover all services"
+     * (ATT_READ_BY_GROUP_TYPE) never got any response. Characteristic
+     * discovery (ATT_READ_BY_TYPE) also never gets a response, in every
+     * variant tried (full range, scoped range, slow and fast connection
+     * interval) -- yet Android's nRF Connect DID fully enumerate this same
+     * device using (presumably) the same standard ATT operations, and did
+     * so in under a second. The one thing never yet tried: my code always
+     * chains characteristic discovery immediately, synchronously, off the
+     * primary-discovery-complete callback, with zero gap. Testing whether
+     * this device's firmware needs a short breather between consecutive
+     * GATT transactions that a naive back-to-back client doesn't give it. */
     k_work_cancel_delayable(&discover_timeout_work);
 
     struct bt_gatt_service_val *service_val = attr->user_data;
-    uint16_t chrc_start_handle = attr->handle + 1;
-    uint16_t chrc_end_handle = service_val->end_handle;
+    pending_chrc_start_handle = attr->handle + 1;
+    pending_chrc_end_handle = service_val->end_handle;
 
     LOG_INF("joycon2: service found, discovering characteristics");
     zmk_joycon2_debug_print("JC2 SERVICE FOUND");
 
-    memset(&discover_params, 0, sizeof(discover_params));
-    discover_params.uuid = NULL;
-    discover_params.func = chrc_discovery_func;
-    discover_params.start_handle = chrc_start_handle;
-    discover_params.end_handle = chrc_end_handle;
-    discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
-
-    int err = bt_gatt_discover(conn, &discover_params);
-    if (err) {
-        LOG_ERR("joycon2: chrc discover failed (%d)", err);
-        zmk_joycon2_debug_print("JC2 CHRC DISCOVER FAILED");
-        return BT_GATT_ITER_STOP;
-    }
-
-    k_work_schedule(&discover_timeout_work, K_SECONDS(JOYCON2_DISCOVER_TIMEOUT_SEC));
+    k_work_schedule(&start_chrc_discover_work, K_MSEC(JOYCON2_CHRC_DISCOVER_DELAY_MS));
     return BT_GATT_ITER_STOP;
 }
 
@@ -508,6 +524,7 @@ static void jc_disconnected(struct bt_conn *conn, uint8_t reason) {
     LOG_INF("joycon2: disconnected (reason %d)", reason);
     k_work_cancel_delayable(&connect_timeout_work);
     k_work_cancel_delayable(&discover_timeout_work);
+    k_work_cancel_delayable(&start_chrc_discover_work);
     bt_conn_unref(jc_conn);
     jc_conn = NULL;
     jc_connecting = false;
@@ -564,6 +581,7 @@ static int joycon2_connection_init(void) {
     k_work_init_delayable(&scan_timeout_work, scan_timeout_work_handler);
     k_work_init_delayable(&connect_timeout_work, connect_timeout_work_handler);
     k_work_init_delayable(&discover_timeout_work, discover_timeout_work_handler);
+    k_work_init_delayable(&start_chrc_discover_work, start_chrc_discover_work_handler);
     k_work_init_delayable(&handshake_work, handshake_work_handler);
     bt_conn_cb_register(&jc_conn_callbacks);
     return 0;
