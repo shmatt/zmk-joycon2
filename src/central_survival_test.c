@@ -22,14 +22,13 @@
 LOG_MODULE_REGISTER(joycon2_central_test, CONFIG_ZMK_LOG_LEVEL);
 
 #define JOYCON2_CENTRAL_TEST_TIMEOUT_SEC 15
-#define JOYCON2_CENTRAL_TEST_REPORT_DELAY_SEC 2
+#define JOYCON2_CENTRAL_TEST_STILL_ALIVE_DELAY_SEC 3
 
 static struct bt_conn *test_conn;
 static bool test_in_progress;
-static bool test_connect_ok;
 
 static struct k_work_delayable test_timeout_work;
-static struct k_work_delayable test_report_work;
+static struct k_work_delayable test_still_alive_work;
 
 struct conn_count_ctx {
     int total;
@@ -53,15 +52,30 @@ static void count_conn_cb(struct bt_conn *conn, void *data) {
     }
 }
 
-static void test_report_work_handler(struct k_work *work) {
-    ARG_UNUSED(work);
-
+/* Builds "total=%d central=%d periph=%d" into msg, appended after whatever
+ * prefix the caller already wrote (via snprintf's return value). */
+static void append_conn_counts(char *msg, size_t msg_size, size_t prefix_len) {
     struct conn_count_ctx ctx = {0};
     bt_conn_foreach(BT_CONN_TYPE_LE, count_conn_cb, &ctx);
 
+    if (prefix_len >= msg_size) {
+        return;
+    }
+    snprintf(msg + prefix_len, msg_size - prefix_len, "total=%d central=%d periph=%d", ctx.total,
+             ctx.central, ctx.peripheral);
+}
+
+static void test_still_alive_work_handler(struct k_work *work) {
+    ARG_UNUSED(work);
+
+    if (test_conn == NULL) {
+        /* already disconnected -- test_disconnected() already reported this */
+        return;
+    }
+
     char msg[96];
-    snprintf(msg, sizeof(msg), "BLE3 TEST connect=%s total=%d central=%d periph=%d",
-             test_connect_ok ? "OK" : "FAIL", ctx.total, ctx.central, ctx.peripheral);
+    int n = snprintf(msg, sizeof(msg), "BLE3 STILL CONNECTED ");
+    append_conn_counts(msg, sizeof(msg), n);
     zmk_joycon2_debug_print(msg);
 
     test_in_progress = false;
@@ -91,9 +105,12 @@ static void scan_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
     int err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN, param, &test_conn);
     if (err) {
         LOG_ERR("central test: create conn failed (%d)", err);
-        test_connect_ok = false;
         k_work_cancel_delayable(&test_timeout_work);
-        k_work_reschedule(&test_report_work, K_NO_WAIT);
+
+        char msg[48];
+        snprintf(msg, sizeof(msg), "BLE3 CREATE CONN FAILED err=%d", err);
+        zmk_joycon2_debug_print(msg);
+        test_in_progress = false;
     }
 }
 
@@ -108,13 +125,25 @@ static void test_connected(struct bt_conn *conn, uint8_t err) {
         LOG_ERR("central test: connect failed (err %d)", err);
         bt_conn_unref(test_conn);
         test_conn = NULL;
-        test_connect_ok = false;
-    } else {
-        LOG_INF("central test: connected");
-        test_connect_ok = true;
+
+        char msg[48];
+        snprintf(msg, sizeof(msg), "BLE3 CONNECT FAILED err=%d", err);
+        zmk_joycon2_debug_print(msg);
+        test_in_progress = false;
+        return;
     }
 
-    k_work_reschedule(&test_report_work, K_SECONDS(JOYCON2_CENTRAL_TEST_REPORT_DELAY_SEC));
+    LOG_INF("central test: connected");
+
+    /* Report immediately -- this is the instant all three roles are
+     * provably alive at once, before the peer (or anything else) gets a
+     * chance to tear the new link back down. */
+    char msg[96];
+    int n = snprintf(msg, sizeof(msg), "BLE3 CONNECTED ");
+    append_conn_counts(msg, sizeof(msg), n);
+    zmk_joycon2_debug_print(msg);
+
+    k_work_reschedule(&test_still_alive_work, K_SECONDS(JOYCON2_CENTRAL_TEST_STILL_ALIVE_DELAY_SEC));
 }
 
 static void test_disconnected(struct bt_conn *conn, uint8_t reason) {
@@ -125,6 +154,13 @@ static void test_disconnected(struct bt_conn *conn, uint8_t reason) {
     LOG_INF("central test: disconnected (reason %d)", reason);
     bt_conn_unref(test_conn);
     test_conn = NULL;
+
+    k_work_cancel_delayable(&test_still_alive_work);
+
+    char msg[64];
+    snprintf(msg, sizeof(msg), "BLE3 TEST-DEV DISCONNECTED reason=0x%02x", reason);
+    zmk_joycon2_debug_print(msg);
+    test_in_progress = false;
 }
 
 static struct bt_conn_cb test_conn_callbacks = {
@@ -151,7 +187,6 @@ int zmk_joycon2_central_test_start(void) {
     }
 
     test_in_progress = true;
-    test_connect_ok = false;
     test_conn = NULL;
 
     int err = bt_le_scan_start(BT_LE_SCAN_PASSIVE, scan_found);
@@ -171,7 +206,7 @@ int zmk_joycon2_central_test_start(void) {
 
 static int joycon2_central_test_init(void) {
     k_work_init_delayable(&test_timeout_work, test_timeout_work_handler);
-    k_work_init_delayable(&test_report_work, test_report_work_handler);
+    k_work_init_delayable(&test_still_alive_work, test_still_alive_work_handler);
     bt_conn_cb_register(&test_conn_callbacks);
     return 0;
 }
