@@ -27,6 +27,7 @@ LOG_MODULE_REGISTER(joycon2_central_test, CONFIG_ZMK_LOG_LEVEL);
 
 static struct bt_conn *test_conn;
 static bool test_in_progress;
+static char test_peer_addr_str[BT_ADDR_LE_STR_LEN];
 
 static struct k_work_delayable test_timeout_work;
 static struct k_work_delayable test_still_alive_work;
@@ -74,8 +75,8 @@ static void test_still_alive_work_handler(struct k_work *work) {
         return;
     }
 
-    char msg[96];
-    int n = snprintf(msg, sizeof(msg), "BLE3 STILL CONNECTED ");
+    char msg[128];
+    int n = snprintf(msg, sizeof(msg), "BLE3 STILL CONNECTED %s ", test_peer_addr_str);
     append_conn_counts(msg, sizeof(msg), n);
     zmk_joycon2_debug_print(msg);
 
@@ -96,9 +97,17 @@ static void scan_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
         return;
     }
 
-    char addr_str[BT_ADDR_LE_STR_LEN];
-    bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
-    LOG_INF("central test: found %s, connecting", addr_str);
+    /* Skip anything we're already connected to -- the host phone or the
+     * other keyboard half in particular -- so a positive result can only
+     * mean a genuinely new, independent third link. */
+    struct bt_conn *existing = bt_conn_lookup_addr_le(BT_ID_DEFAULT, addr);
+    if (existing != NULL) {
+        bt_conn_unref(existing);
+        return;
+    }
+
+    bt_addr_le_to_str(addr, test_peer_addr_str, sizeof(test_peer_addr_str));
+    LOG_INF("central test: found %s, connecting", test_peer_addr_str);
 
     bt_le_scan_stop();
 
@@ -138,9 +147,11 @@ static void test_connected(struct bt_conn *conn, uint8_t err) {
 
     /* Report immediately -- this is the instant all three roles are
      * provably alive at once, before the peer (or anything else) gets a
-     * chance to tear the new link back down. */
-    char msg[96];
-    int n = snprintf(msg, sizeof(msg), "BLE3 CONNECTED ");
+     * chance to tear the new link back down. Peer address is included so
+     * its identity can be cross-checked independently (e.g. via nRF
+     * Connect) against the host phone / other keyboard half. */
+    char msg[128];
+    int n = snprintf(msg, sizeof(msg), "BLE3 CONNECTED %s ", test_peer_addr_str);
     append_conn_counts(msg, sizeof(msg), n);
     zmk_joycon2_debug_print(msg);
 
