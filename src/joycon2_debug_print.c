@@ -107,6 +107,33 @@ static enum joycon2_debug_print_phase print_phase;
 
 static struct k_work_delayable print_work;
 
+/* Small backlog so bursts of near-simultaneous messages (common when several
+ * milestones fire within the same BLE event) queue up instead of silently
+ * dropping -- losing exactly the message that would explain what happened
+ * has cost real debugging time more than once. */
+#define JOYCON2_DEBUG_PRINT_QUEUE_DEPTH 4
+
+static char queue_bufs[JOYCON2_DEBUG_PRINT_QUEUE_DEPTH][JOYCON2_DEBUG_PRINT_BUF_SIZE];
+static size_t queue_lens[JOYCON2_DEBUG_PRINT_QUEUE_DEPTH];
+static uint8_t queue_head;
+static uint8_t queue_tail;
+static uint8_t queue_count;
+
+/* Copies str (plus a trailing space, so back-to-back messages typed with no
+ * gap stay visually separated) into dst, returning the copied length. */
+static size_t format_message(char *dst, size_t dst_size, const char *str) {
+    size_t len = strlen(str);
+    if (len >= dst_size) {
+        len = dst_size - 1;
+    }
+    memcpy(dst, str, len);
+    if (len < dst_size - 1) {
+        dst[len] = ' ';
+        len++;
+    }
+    return len;
+}
+
 static void joycon2_debug_print_work_handler(struct k_work *work) {
     ARG_UNUSED(work);
 
@@ -139,6 +166,18 @@ static void joycon2_debug_print_work_handler(struct k_work *work) {
 
     print_pos++;
     if (print_pos >= print_len) {
+        if (queue_count > 0) {
+            print_len = queue_lens[queue_head];
+            memcpy(print_buf, queue_bufs[queue_head], print_len);
+            queue_head = (queue_head + 1) % JOYCON2_DEBUG_PRINT_QUEUE_DEPTH;
+            queue_count--;
+
+            print_pos = 0;
+            print_phase = JOYCON2_DEBUG_PRINT_PHASE_PRESS;
+            k_work_schedule(&print_work, K_MSEC(JOYCON2_DEBUG_PRINT_STEP_DELAY_MS));
+            return;
+        }
+
         print_len = 0;
         print_pos = 0;
         print_busy = false;
@@ -150,26 +189,28 @@ static void joycon2_debug_print_work_handler(struct k_work *work) {
 }
 
 int zmk_joycon2_debug_print(const char *str) {
-    if (print_busy) {
-        LOG_WRN("debug_print busy, dropping message: %s", str);
-        return -EBUSY;
-    }
-
-    size_t len = strlen(str);
-    if (len == 0) {
+    if (strlen(str) == 0) {
         return 0;
     }
-    if (len >= JOYCON2_DEBUG_PRINT_BUF_SIZE) {
-        len = JOYCON2_DEBUG_PRINT_BUF_SIZE - 1;
+
+    if (!print_busy) {
+        print_len = format_message(print_buf, sizeof(print_buf), str);
+        print_pos = 0;
+        print_phase = JOYCON2_DEBUG_PRINT_PHASE_PRESS;
+        print_busy = true;
+
+        k_work_schedule(&print_work, K_NO_WAIT);
+        return 0;
     }
 
-    memcpy(print_buf, str, len);
-    print_len = len;
-    print_pos = 0;
-    print_phase = JOYCON2_DEBUG_PRINT_PHASE_PRESS;
-    print_busy = true;
+    if (queue_count >= JOYCON2_DEBUG_PRINT_QUEUE_DEPTH) {
+        LOG_WRN("debug_print queue full, dropping message: %s", str);
+        return -ENOSPC;
+    }
 
-    k_work_schedule(&print_work, K_NO_WAIT);
+    queue_lens[queue_tail] = format_message(queue_bufs[queue_tail], sizeof(queue_bufs[queue_tail]), str);
+    queue_tail = (queue_tail + 1) % JOYCON2_DEBUG_PRINT_QUEUE_DEPTH;
+    queue_count++;
     return 0;
 }
 
