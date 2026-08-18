@@ -35,6 +35,32 @@ config ZMK_JOYCON2_BOND
     # press, instead of needing SYNC held every time.
     default y
 
+config ZMK_JOYCON2_AUTO_RECONNECT
+    bool "Scan for a bonded controller again after it disconnects"
+    depends on ZMK_JOYCON2_BOND
+    # OFF by default, and that is a considered default rather than caution:
+    #
+    #  * Zephyr allows ONE scanner with ONE callback, and ZMK's split central
+    #    scans persistently whenever a peripheral slot is unconnected. While
+    #    this module holds the scanner, ZMK's start_scanning() gets -EALREADY
+    #    but leaves its own is_scanning flag set, so once our scan ends nobody
+    #    is scanning and ZMK believes it still is -- the other keyboard half
+    #    can then stay disconnected until a reset. Short, occasional windows
+    #    make that unlikely; a persistent scan would make it likely.
+    #  * A controller only advertises while awake. If it wakes on being jostled
+    #    (in a bag, say) an always-powered keyboard would reconnect to it and
+    #    quietly drain its battery.
+    #
+    # Enable it if reconnecting without holding SYNC matters more than either
+    # of those, and prefer to leave the window bounded.
+    default n
+
+config ZMK_JOYCON2_AUTO_RECONNECT_WINDOW_SEC
+    int "How long to keep scanning after a disconnect"
+    depends on ZMK_JOYCON2_AUTO_RECONNECT
+    # Bounded rather than forever, to keep the scanner-contention window small.
+    default 60
+
 config ZMK_JOYCON2_GAMEPAD
     bool "Expose decoded Joy-Con 2 input to the host as a gamepad"
     depends on ZMK_JOYCON2_CONNECT

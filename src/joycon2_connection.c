@@ -915,6 +915,25 @@ static void jc_disconnected(struct bt_conn *conn, uint8_t reason) {
 #endif
 
     zmk_joycon2_debug_print(msg);
+
+#if IS_ENABLED(CONFIG_ZMK_JOYCON2_AUTO_RECONNECT)
+    /* A bonded controller advertises for this host when it wakes, so a
+     * bounded scan gives it a chance to come back without the combo. Bounded
+     * on purpose: see the Kconfig note about sharing the scanner with ZMK's
+     * split central. */
+    if (!scanning && ctrl_free_slot() != NULL) {
+        int err = bt_le_scan_start(BT_LE_SCAN_PASSIVE, scan_found);
+        if (err) {
+            /* -EALREADY means ZMK's split central owns the scanner; it needs
+             * it more than we do, so leave it alone. */
+            LOG_WRN("joycon2: reconnect scan not started (%d)", err);
+        } else {
+            scanning = true;
+            k_work_schedule(&scan_timeout_work,
+                            K_SECONDS(CONFIG_ZMK_JOYCON2_AUTO_RECONNECT_WINDOW_SEC));
+        }
+    }
+#endif
 }
 
 static void jc_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_t latency,
