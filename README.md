@@ -3,6 +3,10 @@
 Use Nintendo Switch 2 Joy-Con controllers with a ZMK keyboard, and let the
 keyboard republish them to its host as a gamepad and a mouse.
 
+Allows an existing keyboard to act as a bridge for controllers that cannot 
+pair themselves, or can be used to create a ZMK-powered hardware bridge to 
+allow Joy-Con 2 input to any host that supports a gamepad and a mouse.
+
 The keyboard becomes a BLE **central** for the controllers — an extra role
 alongside the host HID link and the split-half link it already maintains — so
 the host only ever sees one device: your keyboard. Nothing is installed on the
