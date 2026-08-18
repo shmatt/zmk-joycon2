@@ -87,6 +87,21 @@ config ZMK_JOYCON2_MOUSE_SCROLL_STEP
     # deflection is roughly 12-25 steps/sec. Raise it to scroll more slowly.
     default 600
 
+config ZMK_JOYCON2_RIGHT_C_CONSUMER_USAGE
+    hex "Consumer usage the right half's C button sends instead of a gamepad button"
+    default 0
+    help
+      When non-zero, the right controller's C button stops acting as a gamepad
+      button and sends this HID Consumer page usage id instead, so a controller
+      can reach a host function the gamepad report cannot express.
+
+      0x0D8 is the standard dictation key, which Android maps to its DICTATE
+      keycode. Note that 0x0CF ("Voice Command") is a different thing: Android
+      maps it to VOICE_ASSIST, which launches the assistant rather than
+      dictating into the focused field.
+
+      0 leaves C as an ordinary gamepad button.
+
 config ZMK_JOYCON2_GAMEPAD
     bool "Expose decoded Joy-Con 2 input to the host as a gamepad"
     depends on ZMK_JOYCON2_CONNECT

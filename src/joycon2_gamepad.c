@@ -25,6 +25,8 @@
 #include <zmk/endpoints.h>
 #include <zmk/hid.h>
 
+#include <dt-bindings/zmk/hid_usage_pages.h>
+
 #include <zmk/joycon2/buttons.h>
 #include <zmk/joycon2/gamepad.h>
 #if IS_ENABLED(CONFIG_ZMK_JOYCON2_MOUSE)
@@ -38,6 +40,17 @@ LOG_MODULE_REGISTER(joycon2_gamepad, CONFIG_ZMK_LOG_LEVEL);
 /* Matches ZMK_HID_GAMEPAD_NUM_BUTTONS. Indices below are 0-based; a
  * gamepad tester shows them as buttons 1-32. */
 #define JOYCON2_GAMEPAD_NUM_BUTTONS ZMK_HID_GAMEPAD_NUM_BUTTONS
+
+/* The right half's C button can send a Consumer page usage rather than a
+ * gamepad button, reaching host functions the gamepad report cannot express --
+ * dictation being the motivating one. Zero leaves C as a gamepad button, and
+ * the mask below then stays 0 so nothing is diverted. */
+#define JOYCON2_RIGHT_C_USAGE CONFIG_ZMK_JOYCON2_RIGHT_C_CONSUMER_USAGE
+#if JOYCON2_RIGHT_C_USAGE != 0
+#define JOYCON2_CONSUMER_MASK(side) ((side) == ZMK_JOYCON2_SIDE_RIGHT ? JC2_C : 0)
+#else
+#define JOYCON2_CONSUMER_MASK(side) 0
+#endif
 
 /* Logical slots.
  *
@@ -188,6 +201,10 @@ static const struct joycon2_profile_map duo_right = {
  * would make each half's report suppress the other's. */
 struct joycon2_side_state {
     bool have_last;
+    /* Whether this half is holding the button that was diverted to a
+     * Consumer usage. Tracked apart from the HID slots because it travels in
+     * a different report. */
+    bool consumer_held;
     /* HID slots this half is currently holding down, one bit per slot. The
      * authority on what has been pressed, rather than the raw button word it
      * came from: the mapping between the two can change while a button is
@@ -251,6 +268,12 @@ void zmk_joycon2_gamepad_release_side(enum zmk_joycon2_side side) {
         if (st->pressed_slots & BIT(i)) {
             zmk_hid_gamepad_button_release(i);
         }
+    }
+
+    if (st->consumer_held) {
+        st->consumer_held = false;
+        zmk_hid_consumer_release(JOYCON2_RIGHT_C_USAGE);
+        ZMK_JOYCON2_SEND_REPORT(HID_USAGE_CONSUMER);
     }
 
     if (map->dpad_to_hat) {
@@ -402,10 +425,17 @@ void zmk_joycon2_gamepad_update(enum zmk_joycon2_side side, uint32_t buttons, ui
      * then emits a press whose release never comes, or a release for a press
      * that never happened. Reconciling against our own state cannot: it is
      * idempotent, so it also repairs itself after a dropped or bogus report. */
+    const uint32_t consumer_mask = JOYCON2_CONSUMER_MASK(side);
+
     uint32_t want_slots = 0;
     for (uint8_t i = 0; i < JOYCON2_GAMEPAD_NUM_BUTTONS; i++) {
         uint32_t mask = map->buttons[i];
         if (!mask || !(buttons & mask)) {
+            continue;
+        }
+        if (mask & consumer_mask) {
+            /* Diverted to the consumer report below, so it must not also
+             * appear as a gamepad button. */
             continue;
         }
 #if IS_ENABLED(CONFIG_ZMK_JOYCON2_MOUSE)
@@ -416,6 +446,25 @@ void zmk_joycon2_gamepad_update(enum zmk_joycon2_side side, uint32_t buttons, ui
         }
 #endif
         want_slots |= BIT(i);
+    }
+
+    /* Ahead of the change gate below: this button contributes nothing to
+     * want_slots or the axes, so a press with nothing else moving would
+     * otherwise be dropped as "no change". */
+    if (consumer_mask) {
+        bool want_consumer = (buttons & consumer_mask) != 0;
+        if (want_consumer != st->consumer_held) {
+            st->consumer_held = want_consumer;
+            if (want_consumer) {
+                zmk_hid_consumer_press(JOYCON2_RIGHT_C_USAGE);
+            } else {
+                zmk_hid_consumer_release(JOYCON2_RIGHT_C_USAGE);
+            }
+            int cerr = ZMK_JOYCON2_SEND_REPORT(HID_USAGE_CONSUMER);
+            if (cerr) {
+                LOG_WRN("joycon2: consumer report send failed (%d)", cerr);
+            }
+        }
     }
 
     bool buttons_changed = want_slots != st->pressed_slots;
