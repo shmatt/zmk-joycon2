@@ -322,15 +322,32 @@ static int8_t scale_axis(uint16_t raw, uint16_t centre, uint16_t travel_pos, uin
 }
 
 
+void zmk_joycon2_gamepad_scale_stick(enum zmk_joycon2_side side, uint16_t raw_x, uint16_t raw_y,
+                                      int8_t *out_x, int8_t *out_y) {
+    const struct zmk_joycon2_stick_calib *cal = &stick_calib[side_index(side)];
+
+    *out_x = scale_axis(raw_x, cal->center_x, cal->max_x, cal->min_x);
+    /* HID Y grows downwards, the stick's raw Y grows upwards. */
+    *out_y = -scale_axis(raw_y, cal->center_y, cal->max_y, cal->min_y);
+}
+
 void zmk_joycon2_gamepad_update(enum zmk_joycon2_side side, uint32_t buttons, uint16_t stick_x_raw,
                                  uint16_t stick_y_raw) {
     struct joycon2_side_state *st = &side_state[side == ZMK_JOYCON2_SIDE_RIGHT ? 1 : 0];
     const struct joycon2_profile_map *map = map_for(side);
 
-    const struct zmk_joycon2_stick_calib *cal = &stick_calib[side_index(side)];
-    int8_t x = scale_axis(stick_x_raw, cal->center_x, cal->max_x, cal->min_x);
-    /* HID Y grows downwards, the stick's raw Y grows upwards. */
-    int8_t y = -scale_axis(stick_y_raw, cal->center_y, cal->max_y, cal->min_y);
+    int8_t x;
+    int8_t y;
+    zmk_joycon2_gamepad_scale_stick(side, stick_x_raw, stick_y_raw, &x, &y);
+
+#if IS_ENABLED(CONFIG_ZMK_JOYCON2_MOUSE)
+    /* While this half drives the pointer its stick is the scroll wheel, so
+     * report it centred here rather than leaving it deflected. */
+    if (zmk_joycon2_mouse_owns(side)) {
+        x = 0;
+        y = 0;
+    }
+#endif
 
     bool buttons_changed = !st->have_last || buttons != st->last_buttons;
     bool axes_changed = !st->have_last || abs(x - st->last_x) >= JOYCON2_AXIS_CHANGE_THRESHOLD ||

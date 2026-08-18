@@ -21,6 +21,7 @@
 #include <zmk/hid.h>
 
 #include <zmk/joycon2/buttons.h>
+#include <zmk/joycon2/gamepad.h>
 #include <zmk/joycon2/mouse.h>
 #include <zmk/joycon2/zmk_compat.h>
 
@@ -40,8 +41,15 @@ LOG_MODULE_REGISTER(joycon2_mouse, CONFIG_ZMK_LOG_LEVEL);
  * pointer across the screen, so it is dropped and the position resynced. */
 #define JOYCON2_MOUSE_GLITCH_THRESHOLD 4096
 
+/* Stick deflection is accumulated and spent in whole wheel steps: emitting a
+ * step per report would scroll absurdly fast at 60-120Hz, and rounding each
+ * report to an integer would drop slow scrolling entirely. */
+#define JOYCON2_SCROLL_STEP CONFIG_ZMK_JOYCON2_MOUSE_SCROLL_STEP
+
 struct joycon2_mouse_side {
     bool have_last;
+    int32_t scroll_acc_x;
+    int32_t scroll_acc_y;
     int16_t last_x;
     int16_t last_y;
     bool on_surface;
@@ -103,6 +111,8 @@ void zmk_joycon2_mouse_reset(enum zmk_joycon2_side side) {
 
     s->have_last = false;
     s->on_surface = false;
+    s->scroll_acc_x = 0;
+    s->scroll_acc_y = 0;
 
     if (owner == side) {
         owner = ZMK_JOYCON2_SIDE_UNKNOWN;
@@ -130,7 +140,8 @@ static void update_owner(enum zmk_joycon2_side side, bool on_surface) {
 }
 
 void zmk_joycon2_mouse_update(enum zmk_joycon2_side side, int16_t raw_x, int16_t raw_y,
-                               uint8_t distance, uint32_t buttons) {
+                               uint8_t distance, uint32_t buttons, uint16_t stick_x_raw,
+                               uint16_t stick_y_raw) {
     struct joycon2_mouse_side *s = &sides[side_index(side)];
     bool on_surface = (distance == JOYCON2_SURFACE_TOUCHING);
 
@@ -141,6 +152,8 @@ void zmk_joycon2_mouse_update(enum zmk_joycon2_side side, int16_t raw_x, int16_t
         /* Airborne: forget the position so the first sample after landing
          * produces no movement, and drop any clicks still held. */
         s->have_last = false;
+        s->scroll_acc_x = 0;
+        s->scroll_acc_y = 0;
         if (release_clicks(s)) {
             zmk_hid_mouse_movement_set(0, 0);
             ZMK_JOYCON2_SEND_MOUSE_REPORT();
@@ -171,6 +184,21 @@ void zmk_joycon2_mouse_update(enum zmk_joycon2_side side, int16_t raw_x, int16_t
     s->last_y = raw_y;
     s->have_last = true;
 
+    /* The stick scrolls while this half drives the pointer. Reusing the
+     * gamepad's scaling keeps one copy of the calibration and deadzone. */
+    int8_t stick_x;
+    int8_t stick_y;
+    zmk_joycon2_gamepad_scale_stick(side, stick_x_raw, stick_y_raw, &stick_x, &stick_y);
+
+    s->scroll_acc_x += stick_x;
+    /* Wheel-up is positive, and the scaled stick Y is positive downwards. */
+    s->scroll_acc_y -= stick_y;
+
+    int8_t scroll_x = (int8_t)CLAMP(s->scroll_acc_x / JOYCON2_SCROLL_STEP, -127, 127);
+    int8_t scroll_y = (int8_t)CLAMP(s->scroll_acc_y / JOYCON2_SCROLL_STEP, -127, 127);
+    s->scroll_acc_x -= scroll_x * JOYCON2_SCROLL_STEP;
+    s->scroll_acc_y -= scroll_y * JOYCON2_SCROLL_STEP;
+
     bool buttons_changed = false;
     bool want_left = (buttons & left_click_mask(side)) != 0;
     bool want_right = (buttons & right_click_mask(side)) != 0;
@@ -194,15 +222,17 @@ void zmk_joycon2_mouse_update(enum zmk_joycon2_side side, int16_t raw_x, int16_t
         buttons_changed = true;
     }
 
-    if (dx == 0 && dy == 0 && !buttons_changed) {
+    if (dx == 0 && dy == 0 && scroll_x == 0 && scroll_y == 0 && !buttons_changed) {
         return;
     }
 
     /* Set rather than accumulate: this is one report's worth of movement. */
     zmk_hid_mouse_movement_set(dx, dy);
+    zmk_hid_mouse_scroll_set(scroll_x, scroll_y);
     ZMK_JOYCON2_SEND_MOUSE_REPORT();
-    /* Movement is relative, so leave the report zeroed for next time --
+    /* Both are relative, so leave the report zeroed for next time --
      * otherwise a report sent for a click alone would repeat the last
-     * movement. */
+     * movement and scroll. */
     zmk_hid_mouse_movement_set(0, 0);
+    zmk_hid_mouse_scroll_set(0, 0);
 }

@@ -81,6 +81,17 @@ config ZMK_JOYCON2_MOUSE_DIVISOR
     # not documented anywhere we have found.
     default 1
 
+config ZMK_JOYCON2_MOUSE_SCROLL_STEP
+    int "Stick deflection needed per wheel step"
+    depends on ZMK_JOYCON2_MOUSE
+    range 16 8192
+    # The stick becomes the scroll wheel while its half drives the pointer.
+    # Deflection (0..127 per report, at 60-120 reports/sec) accumulates and is
+    # spent in whole steps: emitting one per report would scroll absurdly fast,
+    # and rounding per report would drop slow scrolling entirely. At 600, full
+    # deflection is roughly 12-25 steps/sec. Raise it to scroll more slowly.
+    default 600
+
 config ZMK_JOYCON2_GAMEPAD
     bool "Expose decoded Joy-Con 2 input to the host as a gamepad"
     depends on ZMK_JOYCON2_CONNECT

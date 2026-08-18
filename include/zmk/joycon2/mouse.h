@@ -15,9 +15,12 @@
  * a button: whichever half is face-down drives the pointer, and lifting it
  * stops the pointer the way lifting a real mouse does. Either half can do it.
  *
- * While a half owns the pointer its own shoulder pair becomes the clicks --
- * R/ZR on the right, L/ZL on the left -- so the gamepad mapping asks about
- * this before emitting those two.
+ * While a half owns the pointer, its own shoulder pair becomes the clicks and
+ * its stick becomes the scroll wheel, so the gamepad mapping asks about this
+ * before emitting either. The clicks are mirrored between the halves: R left
+ * and ZR right on the right, ZL left and L right on the left, because resting
+ * a half face-down puts a different one of the pair under the finger that
+ * naturally left-clicks.
  */
 bool zmk_joycon2_mouse_owns(enum zmk_joycon2_side side);
 
@@ -29,7 +32,8 @@ bool zmk_joycon2_mouse_owns(enum zmk_joycon2_side side);
  * a surface, anything higher means airborne (typically around 12).
  */
 void zmk_joycon2_mouse_update(enum zmk_joycon2_side side, int16_t raw_x, int16_t raw_y,
-                               uint8_t distance, uint32_t buttons);
+                               uint8_t distance, uint32_t buttons, uint16_t stick_x_raw,
+                               uint16_t stick_y_raw);
 
 /* Drops any held clicks and forgets the sensor position, so a disconnect
  * cannot leave a click stuck down or fling the pointer on reconnect. */

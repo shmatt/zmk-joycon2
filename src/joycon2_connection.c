@@ -390,28 +390,35 @@ static void decode_input_report(struct joycon2_ctrl *c, const uint8_t *data, uin
 
     uint32_t buttons = sys_get_le32(&data[JOYCON2_REPORT_BUTTONS_OFFSET]) & JOYCON2_BUTTON_MASK;
 
-#if IS_ENABLED(CONFIG_ZMK_JOYCON2_GAMEPAD)
-    /* Runs for every report, not just on button change, so stick movement
-     * is continuous; it does its own change detection and rate limiting. */
+    /* Each half reports its own stick, so pick the field for this side and
+     * parse it once: the gamepad and the mouse's scroll wheel both want it. */
+    uint16_t stick_x = 0;
+    uint16_t stick_y = 0;
     uint16_t stick_offset = (c->side == ZMK_JOYCON2_SIDE_RIGHT)
                                 ? JOYCON2_REPORT_RIGHT_STICK_OFFSET
                                 : JOYCON2_REPORT_LEFT_STICK_OFFSET;
     if (length >= stick_offset + 3) {
         /* 12-bit X and Y packed into three bytes. */
         const uint8_t *st = &data[stick_offset];
-        uint16_t stick_x = st[0] | ((uint16_t)(st[1] & 0x0F) << 8);
-        uint16_t stick_y = (st[1] >> 4) | ((uint16_t)st[2] << 4);
-        zmk_joycon2_gamepad_update(c->side, buttons, stick_x, stick_y);
+        stick_x = st[0] | ((uint16_t)(st[1] & 0x0F) << 8);
+        stick_y = (st[1] >> 4) | ((uint16_t)st[2] << 4);
     }
-#endif
 
 #if IS_ENABLED(CONFIG_ZMK_JOYCON2_MOUSE)
+    /* Before the gamepad, so that when this half takes over the pointer the
+     * gamepad sees it on this same report rather than one report later. */
     if (length > JOYCON2_REPORT_SURFACE_OFFSET) {
         zmk_joycon2_mouse_update(c->side,
                                   (int16_t)sys_get_le16(&data[JOYCON2_REPORT_MOUSE_X_OFFSET]),
                                   (int16_t)sys_get_le16(&data[JOYCON2_REPORT_MOUSE_Y_OFFSET]),
-                                  data[JOYCON2_REPORT_SURFACE_OFFSET], buttons);
+                                  data[JOYCON2_REPORT_SURFACE_OFFSET], buttons, stick_x, stick_y);
     }
+#endif
+
+#if IS_ENABLED(CONFIG_ZMK_JOYCON2_GAMEPAD)
+    /* Runs for every report, not just on button change, so stick movement is
+     * continuous; it does its own change detection and rate limiting. */
+    zmk_joycon2_gamepad_update(c->side, buttons, stick_x, stick_y);
 #endif
 
     if (c->have_last_buttons && buttons == c->last_buttons) {

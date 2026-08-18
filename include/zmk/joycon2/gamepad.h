@@ -59,6 +59,12 @@ void zmk_joycon2_gamepad_set_calibration(enum zmk_joycon2_side side,
  * connect/disconnect; it only acts on a change. */
 void zmk_joycon2_gamepad_set_connected_count(uint8_t count);
 
+/* Raw 12-bit stick values to -127..127, using that half's calibration and
+ * deadzone. Exposed so the mouse can reuse the calibration rather than keep a
+ * second copy of it. Y is returned in HID's sense: positive is down. */
+void zmk_joycon2_gamepad_scale_stick(enum zmk_joycon2_side side, uint16_t raw_x, uint16_t raw_y,
+                                      int8_t *out_x, int8_t *out_y);
+
 /* Feed one decoded Joy-Con 2 input report into the gamepad HID report sent
  * to the host. Call for every report; change detection and rate limiting
  * happen inside. Stick values are the raw 12-bit values from the report
