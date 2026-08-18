@@ -22,6 +22,9 @@ if(CONFIG_ZMK_JOYCON2 AND ((NOT CONFIG_ZMK_SPLIT) OR CONFIG_ZMK_SPLIT_ROLE_CENTR
   zephyr_library_sources_ifdef(CONFIG_ZMK_JOYCON2_GAMEPAD
     src/joycon2_gamepad.c
   )
+  zephyr_library_sources_ifdef(CONFIG_ZMK_JOYCON2_MOUSE
+    src/joycon2_mouse.c
+  )
 
   # Embeds this module's exact git commit so debug-print output can prove
   # which build is actually running -- across a fast-iterating build/flash

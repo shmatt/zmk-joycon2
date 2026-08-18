@@ -61,6 +61,26 @@ config ZMK_JOYCON2_AUTO_RECONNECT_WINDOW_SEC
     # Bounded rather than forever, to keep the scanner-contention window small.
     default 60
 
+config ZMK_JOYCON2_MOUSE
+    bool "Drive the host's mouse pointer from the optical sensor"
+    depends on ZMK_JOYCON2_CONNECT
+    # ZMK already has a mouse report, so this needs no firmware patch -- and
+    # the sensor is already running, because the handshake enables every
+    # feature. Either half can drive the pointer: resting one on a surface
+    # hands it the pointer and lifting it stops, the way a real mouse does,
+    # so there is no mode key to remember.
+    depends on ZMK_MOUSE || ZMK_POINTING
+    default y
+
+config ZMK_JOYCON2_MOUSE_DIVISOR
+    int "Divide the sensor's movement by this before sending it"
+    depends on ZMK_JOYCON2_MOUSE
+    range 1 32
+    # 1 passes the sensor through untouched. Raise it if the pointer moves
+    # too fast; the right value depends on the sensor's resolution, which is
+    # not documented anywhere we have found.
+    default 1
+
 config ZMK_JOYCON2_GAMEPAD
     bool "Expose decoded Joy-Con 2 input to the host as a gamepad"
     depends on ZMK_JOYCON2_CONNECT

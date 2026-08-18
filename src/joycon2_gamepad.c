@@ -25,39 +25,15 @@
 #include <zmk/endpoints.h>
 #include <zmk/hid.h>
 
+#include <zmk/joycon2/buttons.h>
 #include <zmk/joycon2/gamepad.h>
+#if IS_ENABLED(CONFIG_ZMK_JOYCON2_MOUSE)
+#include <zmk/joycon2/mouse.h>
+#endif
 #include <zmk/joycon2/zmk_compat.h>
 
 LOG_MODULE_REGISTER(joycon2_gamepad, CONFIG_ZMK_LOG_LEVEL);
 
-/* Joy-Con 2 button bits -- see the input-report layout notes in
- * joycon2_connection.c. Left-half and right-half buttons occupy distinct
- * bits in the same 32-bit word, so one table covers both. */
-#define JC2_Y 0x00000001U
-#define JC2_X 0x00000002U
-#define JC2_B 0x00000004U
-#define JC2_A 0x00000008U
-#define JC2_SR_R 0x00000010U
-#define JC2_SL_R 0x00000020U
-#define JC2_R 0x00000040U
-#define JC2_ZR 0x00000080U
-#define JC2_MINUS 0x00000100U
-#define JC2_PLUS 0x00000200U
-#define JC2_RSTK 0x00000400U
-#define JC2_LSTK 0x00000800U
-#define JC2_HOME 0x00001000U
-#define JC2_CAPTURE 0x00002000U
-#define JC2_C 0x00004000U
-#define JC2_DOWN 0x00010000U
-#define JC2_UP 0x00020000U
-#define JC2_RIGHT 0x00040000U
-#define JC2_LEFT 0x00080000U
-#define JC2_SR_L 0x00100000U
-#define JC2_SL_L 0x00200000U
-#define JC2_L 0x00400000U
-#define JC2_ZL 0x00800000U
-#define JC2_GR 0x01000000U
-#define JC2_GL 0x02000000U
 
 /* Matches ZMK_HID_GAMEPAD_NUM_BUTTONS. Indices below are 0-based; a
  * gamepad tester shows them as buttons 1-32. */
@@ -197,14 +173,14 @@ static const struct joycon2_profile_map duo_right = {
             [PAD_FACE_UP] = JC2_X,
             [PAD_R1] = JC2_R,
             [PAD_R2] = JC2_ZR,
+            /* One of the two slots ordinary games ignore, kept for Matt's own
+             * app; Minus takes the other (Z) on the left half. */
+            [PAD_C] = JC2_C,
             /* Home is Start and Plus is Mode, matching solo, so the same
              * button does the same thing in either profile. */
             [PAD_START] = JC2_HOME,
             [PAD_MODE] = JC2_PLUS,
             [PAD_THUMBR] = JC2_RSTK,
-            /* The other app-usable spare, and a natural home for the
-             * physical C button. */
-            [PAD_C] = JC2_C,
         },
 };
 
@@ -291,6 +267,13 @@ static struct zmk_joycon2_stick_calib stick_calib[2] = {
            .min_y = JOYCON2_STICK_DEFAULT_RANGE},
 };
 
+#if IS_ENABLED(CONFIG_ZMK_JOYCON2_MOUSE)
+/* Mirrored between the halves -- see the note in joycon2_mouse.c. */
+static uint32_t mouse_click_masks(enum zmk_joycon2_side side) {
+    return side == ZMK_JOYCON2_SIDE_RIGHT ? (JC2_R | JC2_ZR) : (JC2_L | JC2_ZL);
+}
+#endif
+
 static size_t side_index(enum zmk_joycon2_side side) {
     return side == ZMK_JOYCON2_SIDE_RIGHT ? 1 : 0;
 }
@@ -367,6 +350,14 @@ void zmk_joycon2_gamepad_update(enum zmk_joycon2_side side, uint32_t buttons, ui
             if (!mask) {
                 continue;
             }
+#if IS_ENABLED(CONFIG_ZMK_JOYCON2_MOUSE)
+            /* While this half is driving the pointer, its shoulder pair is
+             * the mouse's clicks, so it must not also fire as R1/R2 (or
+             * L1/L2). */
+            if ((mask & mouse_click_masks(side)) && zmk_joycon2_mouse_owns(side)) {
+                continue;
+            }
+#endif
             bool now_pressed = (buttons & mask) != 0;
             bool was_pressed = st->have_last && (st->last_buttons & mask) != 0;
             if (now_pressed == was_pressed) {

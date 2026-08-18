@@ -22,6 +22,9 @@
 
 #include <zmk/joycon2/connection.h>
 #include <zmk/joycon2/gamepad.h>
+#if IS_ENABLED(CONFIG_ZMK_JOYCON2_MOUSE)
+#include <zmk/joycon2/mouse.h>
+#endif
 #include <zmk/joycon2/debug_print.h>
 
 LOG_MODULE_REGISTER(joycon2_connection, CONFIG_ZMK_LOG_LEVEL);
@@ -344,6 +347,12 @@ static bool handle_memory_read_reply(struct joycon2_ctrl *c, const uint8_t *data
 #define JOYCON2_REPORT_LEFT_STICK_OFFSET 10
 #define JOYCON2_REPORT_RIGHT_STICK_OFFSET 13
 
+/* Optical mouse sensor: an accumulated position rather than per-frame deltas,
+ * plus a surface reading at 0x17 where 0 means touching. */
+#define JOYCON2_REPORT_MOUSE_X_OFFSET 0x10
+#define JOYCON2_REPORT_MOUSE_Y_OFFSET 0x12
+#define JOYCON2_REPORT_SURFACE_OFFSET 0x17
+
 /* The top three bits of the button word are always set on this hardware
  * (some always-on status flags, not buttons) -- mask to the documented
  * button bits so they don't read as phantom presses. */
@@ -393,6 +402,15 @@ static void decode_input_report(struct joycon2_ctrl *c, const uint8_t *data, uin
         uint16_t stick_x = st[0] | ((uint16_t)(st[1] & 0x0F) << 8);
         uint16_t stick_y = (st[1] >> 4) | ((uint16_t)st[2] << 4);
         zmk_joycon2_gamepad_update(c->side, buttons, stick_x, stick_y);
+    }
+#endif
+
+#if IS_ENABLED(CONFIG_ZMK_JOYCON2_MOUSE)
+    if (length > JOYCON2_REPORT_SURFACE_OFFSET) {
+        zmk_joycon2_mouse_update(c->side,
+                                  (int16_t)sys_get_le16(&data[JOYCON2_REPORT_MOUSE_X_OFFSET]),
+                                  (int16_t)sys_get_le16(&data[JOYCON2_REPORT_MOUSE_Y_OFFSET]),
+                                  data[JOYCON2_REPORT_SURFACE_OFFSET], buttons);
     }
 #endif
 
@@ -905,6 +923,9 @@ static void jc_disconnected(struct bt_conn *conn, uint8_t reason) {
     c->have_last_buttons = false;
     c->pending_read_addr = 0;
     c->calib_alt_tried = false;
+#if IS_ENABLED(CONFIG_ZMK_JOYCON2_MOUSE)
+    zmk_joycon2_mouse_reset(c->side);
+#endif
 
     char msg[48];
     snprintf(msg, sizeof(msg), "JC2 DISCONNECTED %s reason=0x%02x", side_tag(c->side), reason);
