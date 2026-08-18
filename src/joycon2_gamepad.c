@@ -188,10 +188,17 @@ static const struct joycon2_profile_map duo_right = {
  * would make each half's report suppress the other's. */
 struct joycon2_side_state {
     bool have_last;
-    uint32_t last_buttons;
+    /* HID slots this half is currently holding down, one bit per slot. The
+     * authority on what has been pressed, rather than the raw button word it
+     * came from: the mapping between the two can change while a button is
+     * held (see zmk_joycon2_gamepad_update). */
+    uint32_t pressed_slots;
     int8_t last_x;
     int8_t last_y;
 };
+
+BUILD_ASSERT(JOYCON2_GAMEPAD_NUM_BUTTONS <= 32,
+             "pressed_slots holds one bit per HID slot and so caps at 32");
 
 static struct joycon2_side_state side_state[2];
 
@@ -221,6 +228,44 @@ void zmk_joycon2_gamepad_set_connected_count(uint8_t count) {
      * stay stuck down at a HID index the new mapping never touches. */
     zmk_hid_gamepad_clear();
     memset(side_state, 0, sizeof(side_state));
+    ZMK_JOYCON2_SEND_GAMEPAD_REPORT();
+}
+
+/* Drop whatever one half was holding. Called when a controller goes away:
+ * without it, a button held at the moment of disconnect stays pressed on the
+ * host forever, because the release can only ever come from a report that
+ * controller is no longer sending. The host then ignores further presses of
+ * that button -- it already believes it is down -- which reads as the button
+ * having died. Profile changes clear everything instead, but a controller
+ * dropping does not necessarily change the profile: with a single controller
+ * connected, one to none is still SOLO. */
+void zmk_joycon2_gamepad_release_side(enum zmk_joycon2_side side) {
+    if (side != ZMK_JOYCON2_SIDE_LEFT && side != ZMK_JOYCON2_SIDE_RIGHT) {
+        return;
+    }
+
+    struct joycon2_side_state *st = &side_state[side == ZMK_JOYCON2_SIDE_RIGHT ? 1 : 0];
+    const struct joycon2_profile_map *map = map_for(side);
+
+    for (uint8_t i = 0; i < JOYCON2_GAMEPAD_NUM_BUTTONS; i++) {
+        if (st->pressed_slots & BIT(i)) {
+            zmk_hid_gamepad_button_release(i);
+        }
+    }
+
+    if (map->dpad_to_hat) {
+        zmk_hid_gamepad_dpad_set(false, false, false, false);
+    }
+
+    /* Centre this half's stick too, so a controller that vanishes mid-tilt
+     * does not leave the host holding a direction. */
+    if (current_profile == ZMK_JOYCON2_PROFILE_DUO && side == ZMK_JOYCON2_SIDE_RIGHT) {
+        zmk_hid_gamepad_right_stick_set(0, 0);
+    } else {
+        zmk_hid_gamepad_left_stick_set(0, 0);
+    }
+
+    memset(st, 0, sizeof(*st));
     ZMK_JOYCON2_SEND_GAMEPAD_REPORT();
 }
 
@@ -349,7 +394,31 @@ void zmk_joycon2_gamepad_update(enum zmk_joycon2_side side, uint32_t buttons, ui
     }
 #endif
 
-    bool buttons_changed = !st->have_last || buttons != st->last_buttons;
+    /* Build what this half should be holding, then reconcile it against what
+     * it actually holds. Deliberately not a diff of consecutive button words:
+     * the mapping from a physical button to a HID slot can change while that
+     * button is held down -- the pointer taking over the shoulder pair, or a
+     * second controller switching the profile -- and a diff of the inputs
+     * then emits a press whose release never comes, or a release for a press
+     * that never happened. Reconciling against our own state cannot: it is
+     * idempotent, so it also repairs itself after a dropped or bogus report. */
+    uint32_t want_slots = 0;
+    for (uint8_t i = 0; i < JOYCON2_GAMEPAD_NUM_BUTTONS; i++) {
+        uint32_t mask = map->buttons[i];
+        if (!mask || !(buttons & mask)) {
+            continue;
+        }
+#if IS_ENABLED(CONFIG_ZMK_JOYCON2_MOUSE)
+        /* While this half is driving the pointer, its shoulder pair is the
+         * mouse's clicks, so it must not also fire as R1/R2 (or L1/L2). */
+        if ((mask & mouse_click_masks(side)) && zmk_joycon2_mouse_owns(side)) {
+            continue;
+        }
+#endif
+        want_slots |= BIT(i);
+    }
+
+    bool buttons_changed = want_slots != st->pressed_slots;
     bool axes_changed = !st->have_last || abs(x - st->last_x) >= JOYCON2_AXIS_CHANGE_THRESHOLD ||
                         abs(y - st->last_y) >= JOYCON2_AXIS_CHANGE_THRESHOLD ||
                         /* Always report a return to exact centre, however
@@ -362,30 +431,18 @@ void zmk_joycon2_gamepad_update(enum zmk_joycon2_side side, uint32_t buttons, ui
     }
 
     if (buttons_changed) {
+        uint32_t to_press = want_slots & ~st->pressed_slots;
+        uint32_t to_release = st->pressed_slots & ~want_slots;
+
         for (uint8_t i = 0; i < JOYCON2_GAMEPAD_NUM_BUTTONS; i++) {
-            uint32_t mask = map->buttons[i];
-            if (!mask) {
-                continue;
-            }
-#if IS_ENABLED(CONFIG_ZMK_JOYCON2_MOUSE)
-            /* While this half is driving the pointer, its shoulder pair is
-             * the mouse's clicks, so it must not also fire as R1/R2 (or
-             * L1/L2). */
-            if ((mask & mouse_click_masks(side)) && zmk_joycon2_mouse_owns(side)) {
-                continue;
-            }
-#endif
-            bool now_pressed = (buttons & mask) != 0;
-            bool was_pressed = st->have_last && (st->last_buttons & mask) != 0;
-            if (now_pressed == was_pressed) {
-                continue;
-            }
-            if (now_pressed) {
+            if (to_press & BIT(i)) {
                 zmk_hid_gamepad_button_press(i);
-            } else {
+            } else if (to_release & BIT(i)) {
                 zmk_hid_gamepad_button_release(i);
             }
         }
+
+        st->pressed_slots = want_slots;
     }
 
     if (map->dpad_to_hat) {
@@ -403,7 +460,6 @@ void zmk_joycon2_gamepad_update(enum zmk_joycon2_side side, uint32_t buttons, ui
     }
 
     st->have_last = true;
-    st->last_buttons = buttons;
     st->last_x = x;
     st->last_y = y;
 

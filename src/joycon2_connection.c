@@ -108,6 +108,9 @@ struct joycon2_ctrl {
      * the command ACKs that share the response characteristic. */
     uint32_t pending_read_addr;
     bool calib_alt_tried;
+    /* Last rejected report length, so a format change is announced once
+     * rather than at the report rate. */
+    uint16_t last_short_len;
 };
 
 static struct joycon2_ctrl controllers[JOYCON2_MAX_CONTROLLERS];
@@ -338,6 +341,12 @@ static bool handle_memory_read_reply(struct joycon2_ctrl *c, const uint8_t *data
 }
 
 #define JOYCON2_REPORT_MIN_LEN 8
+/* Every field the decode reads has to be present for the report to mean what
+ * we think it means. Byte 4 is the button word only in the full input report,
+ * so decoding a shorter variant there invents button state -- and because a
+ * held button then reads as released, the host sees it let go while it is
+ * still physically down. */
+#define JOYCON2_REPORT_DECODE_MIN_LEN (JOYCON2_REPORT_RIGHT_STICK_OFFSET + 3)
 #define JOYCON2_REPORT_BUTTONS_OFFSET 4
 #define JOYCON2_REPORT_BATTERY_OFFSET 0x1F
 /* Each half reports its own stick in its own field, and leaves the other
@@ -385,6 +394,16 @@ static const struct joycon2_button joycon2_buttons[] = {
  * gamepad unusable for actually playing anything. */
 static void decode_input_report(struct joycon2_ctrl *c, const uint8_t *data, uint16_t length) {
     if (length < JOYCON2_REPORT_MIN_LEN) {
+        return;
+    }
+
+    if (length < JOYCON2_REPORT_DECODE_MIN_LEN) {
+        if (length != c->last_short_len) {
+            c->last_short_len = length;
+            char msg[40];
+            snprintf(msg, sizeof(msg), "JC2 SHORT %s len=%u", side_tag(c->side), length);
+            zmk_joycon2_debug_print(msg);
+        }
         return;
     }
 
@@ -932,6 +951,12 @@ static void jc_disconnected(struct bt_conn *conn, uint8_t reason) {
     c->calib_alt_tried = false;
 #if IS_ENABLED(CONFIG_ZMK_JOYCON2_MOUSE)
     zmk_joycon2_mouse_reset(c->side);
+#endif
+#if IS_ENABLED(CONFIG_ZMK_JOYCON2_GAMEPAD)
+    /* Before c->side is cleared below, and unconditionally: losing one of two
+     * controllers changes the profile and clears everything anyway, but
+     * losing the only one does not. */
+    zmk_joycon2_gamepad_release_side(c->side);
 #endif
 
     char msg[48];

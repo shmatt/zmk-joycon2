@@ -59,6 +59,12 @@ void zmk_joycon2_gamepad_set_calibration(enum zmk_joycon2_side side,
  * connect/disconnect; it only acts on a change. */
 void zmk_joycon2_gamepad_set_connected_count(uint8_t count);
 
+/* Release everything one half is holding -- buttons, its hat and its stick.
+ * Call when that controller disconnects: the release for a held button can
+ * only come from a report it is no longer sending, so without this the host
+ * keeps the button down and ignores later presses of it. */
+void zmk_joycon2_gamepad_release_side(enum zmk_joycon2_side side);
+
 /* Raw 12-bit stick values to -127..127, using that half's calibration and
  * deadzone. Exposed so the mouse can reuse the calibration rather than keep a
  * second copy of it. Y is returned in HID's sense: positive is down. */
