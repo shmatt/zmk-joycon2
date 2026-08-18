@@ -260,13 +260,20 @@ static void unpack_xy(const uint8_t *d, uint16_t *x, uint16_t *y) {
     *y = (d[1] >> 4) | ((uint16_t)d[2] << 4);
 }
 
-/* Each half stores its stick's calibration at one of these two addresses.
- * The obvious guess -- right half at the "stick 2" address -- turned out to
- * be wrong on a real right Joy-Con, which returned erased flash there, so
- * the other address is tried before giving up. */
+/* BOTH halves keep their stick's calibration at the "stick 1" address,
+ * confirmed by reading real hardware: a right Joy-Con returned erased flash
+ * from the "stick 2" address and valid data from stick 1. That makes sense --
+ * each Joy-Con has one stick, so it is stick 1 from its own point of view;
+ * the second address only means anything on a two-stick controller like the
+ * Pro Controller. The reference implementations read both because they also
+ * support those, which is what led to the wrong guess here.
+ *
+ * The second address is still tried as a fallback, so a two-stick controller
+ * would work if support for one is ever added.
+ */
 static uint32_t stick_calib_addr(enum zmk_joycon2_side side, bool alternate) {
-    bool right = (side == ZMK_JOYCON2_SIDE_RIGHT) != alternate;
-    return right ? JOYCON2_CALIB_ADDR_STICK_RIGHT : JOYCON2_CALIB_ADDR_STICK_LEFT;
+    ARG_UNUSED(side);
+    return alternate ? JOYCON2_CALIB_ADDR_STICK_RIGHT : JOYCON2_CALIB_ADDR_STICK_LEFT;
 }
 
 static int jc_write_command(struct joycon2_ctrl *c, const uint8_t *data, size_t len);
