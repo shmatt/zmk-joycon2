@@ -12,16 +12,11 @@ config ZMK_JOYCON2_LEGACY_ENDPOINT_API
     default n
 
 config ZMK_JOYCON2_DEBUG_PRINT
-    bool "HID debug-print helper (types debug text as keystrokes via the host HID connection)"
-    default y
-
-config ZMK_JOYCON2_CENTRAL_TEST
-    bool "Stage 1 sub-stage 2: third BLE central role survival test"
-    depends on ZMK_JOYCON2_DEBUG_PRINT
+    bool "Debug output typed through the keyboard's own HID connection"
     default y
 
 config ZMK_JOYCON2_CONNECT
-    bool "Stage 1 sub-stage 4: connect to a real Joy-Con 2 and relay raw input bytes"
+    bool "Connect to Joy-Con 2 controllers over BLE"
     depends on ZMK_JOYCON2_DEBUG_PRINT
     default y
 

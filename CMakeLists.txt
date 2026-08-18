@@ -11,10 +11,6 @@ if(CONFIG_ZMK_JOYCON2 AND ((NOT CONFIG_ZMK_SPLIT) OR CONFIG_ZMK_SPLIT_ROLE_CENTR
     src/joycon2_debug_print.c
     src/behavior_joycon2_debug_print.c
   )
-  zephyr_library_sources_ifdef(CONFIG_ZMK_JOYCON2_CENTRAL_TEST
-    src/central_survival_test.c
-    src/behavior_joycon2_central_test.c
-  )
   zephyr_library_sources_ifdef(CONFIG_ZMK_JOYCON2_CONNECT
     src/joycon2_connection.c
     src/behavior_joycon2_connect.c
