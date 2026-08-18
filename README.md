@@ -124,10 +124,22 @@ combo works well, since it costs no keymap position:
 If a controller stops being found after several quick attempts, wait a couple
 of minutes: the controllers have their own connection cooldown.
 
-**On Android, forget and re-pair the keyboard after the first flash.** Android
-caches the HID report descriptor per bonded device, so until you do, the host
-has no idea the gamepad exists — which looks identical to the firmware not
-working.
+**On Android, forget and re-pair the keyboard after the first flash — and
+after any change to ZMK's HID configuration.** Android caches the HID report
+descriptor per bonded device and does not re-read it while the bond survives,
+so until you re-pair, the host parses new reports using the old layout. Clear
+it from both ends: forget the keyboard in Android's Bluetooth settings, and
+run `&bt BT_CLR` on the active profile from the keymap. Two failure modes,
+both of which look exactly like broken firmware:
+
+- Before the first re-pair, the host has no idea the gamepad exists.
+- If the *mouse* report changes shape, every field is read from the wrong
+  offset. Moving from a tree with 8-bit mouse axes to one with 16-bit axes
+  (`CONFIG_ZMK_POINTING`) makes X roughly work, bleeds X's high byte into Y,
+  and lands Y in the scroll wheel, while real scroll falls outside the report
+  the host thinks it is reading. This hits ZMK's own mouse keys as well as
+  this module — that both break identically is the tell that the descriptor
+  is stale rather than the code being wrong.
 
 ## Mapping
 
