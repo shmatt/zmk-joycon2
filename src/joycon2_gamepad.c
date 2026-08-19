@@ -201,6 +201,9 @@ static const struct joycon2_profile_map duo_right = {
  * would make each half's report suppress the other's. */
 struct joycon2_side_state {
     bool have_last;
+    /* The D-pad bits last sent through the hat. The hat is not a button slot,
+     * so it needs its own change detection -- see zmk_joycon2_gamepad_update. */
+    uint32_t last_dpad;
     /* Whether this half is holding the button that was diverted to a
      * Consumer usage. Tracked apart from the HID slots because it travels in
      * a different report. */
@@ -467,6 +470,16 @@ void zmk_joycon2_gamepad_update(enum zmk_joycon2_side side, uint32_t buttons, ui
         }
     }
 
+    /* The D-pad goes to the hat rather than to a button slot, so it changes
+     * neither want_slots nor the axes. Without its own comparison here, a
+     * D-pad press with nothing else moving is discarded by the gate below and
+     * the hat is never sent -- which is exactly how the D-pad stopped working
+     * when this function moved to reconciling slots. */
+    uint32_t dpad_bits = map->dpad_to_hat
+                             ? (buttons & (JC2_UP | JC2_DOWN | JC2_LEFT | JC2_RIGHT))
+                             : 0;
+    bool dpad_changed = dpad_bits != st->last_dpad;
+
     bool buttons_changed = want_slots != st->pressed_slots;
     bool axes_changed = !st->have_last || abs(x - st->last_x) >= JOYCON2_AXIS_CHANGE_THRESHOLD ||
                         abs(y - st->last_y) >= JOYCON2_AXIS_CHANGE_THRESHOLD ||
@@ -475,7 +488,7 @@ void zmk_joycon2_gamepad_update(enum zmk_joycon2_side side, uint32_t buttons, ui
                          * just shy of neutral. */
                         ((x == 0 || y == 0) && (st->last_x != x || st->last_y != y));
 
-    if (!buttons_changed && !axes_changed) {
+    if (!buttons_changed && !axes_changed && !dpad_changed) {
         return;
     }
 
@@ -509,6 +522,7 @@ void zmk_joycon2_gamepad_update(enum zmk_joycon2_side side, uint32_t buttons, ui
     }
 
     st->have_last = true;
+    st->last_dpad = dpad_bits;
     st->last_x = x;
     st->last_y = y;
 
