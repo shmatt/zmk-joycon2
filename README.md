@@ -188,7 +188,23 @@ there, and [Findings](#findings) below.
 | `ZMK_JOYCON2_DEBUG_PRINT` | `y` | debug channel (silent until toggled) |
 | `ZMK_JOYCON2_BOND` | `y` | store this host on the controller |
 | `ZMK_JOYCON2_AUTO_RECONNECT` | `n` | rescan after a disconnect — read below |
+| `ZMK_JOYCON2_RIGHT_C_CONSUMER_USAGE` | `0` | send a Consumer usage from C instead of a button |
 | `ZMK_JOYCON2_LEGACY_ENDPOINT_API` | `n` | for pre-rename ZMK trees |
+
+`ZMK_JOYCON2_RIGHT_C_CONSUMER_USAGE` diverts the right half's C button to the
+HID Consumer page, reaching host functions a gamepad report cannot express.
+`0x0D8` is the standard dictation key, which Android maps to `DICTATE`; note
+that `0x0CF` ("Voice Command") is a different thing and only launches the
+assistant. C stops acting as a gamepad button while this is set.
+
+If a consumer usage does nothing on the host, suspect ZMK's report type before
+suspecting the usage. `choice ZMK_HID_CONSUMER_REPORT_USAGES` has no `default`,
+so builds silently get `..._USAGES_FULL` (16-bit ids), which ZMK's own help
+warns "has compatibility issues with some host OSes" -- on Android that showed
+up as media keys working only sometimes, for years, and dictation never.
+`CONFIG_ZMK_HID_CONSUMER_REPORT_USAGES_BASIC=y` fixed both. Everything here
+fits under its `0xFF` ceiling. It changes the report descriptor, so re-pair
+afterwards.
 
 `ZMK_JOYCON2_AUTO_RECONNECT` is off deliberately. Zephyr allows one scanner
 with one callback, and ZMK's split central scans whenever a peripheral is
