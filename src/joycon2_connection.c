@@ -452,8 +452,13 @@ static void decode_input_report(struct joycon2_ctrl *c, const uint8_t *data, uin
         return;
     }
 
+    /* The raw word and the report length come first because they are what
+     * distinguishes a real release from a report we misread: a held button
+     * whose word reads 0 means the bit vanished from the data we decoded, and
+     * the length says whether the report was framed as we expect. */
     char msg[128];
-    int n = snprintf(msg, sizeof(msg), "JC2 BTN-%s", side_tag(c->side));
+    int n = snprintf(msg, sizeof(msg), "JC2 BTN-%s w=%08x l=%u", side_tag(c->side),
+                     (unsigned int)buttons, (unsigned int)length);
     if (buttons == 0) {
         n += snprintf(msg + n, sizeof(msg) - n, " --");
     } else {
