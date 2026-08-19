@@ -32,6 +32,15 @@ LOG_MODULE_REGISTER(joycon2_mouse, CONFIG_ZMK_LOG_LEVEL);
  * Confirmed on hardware by the JoyCon2Mac authors. */
 #define JOYCON2_SURFACE_TOUCHING 0
 
+/* Consecutive readings needed before the surface state is believed. The sensor
+ * reports right on the threshold when a half is held just above a surface, and
+ * a single-report decision then toggles ownership at the report rate. That is
+ * not merely cosmetic: ownership decides whether the shoulder pair is a pair of
+ * gamepad buttons or the mouse's clicks, so a flickering reading releases and
+ * re-presses a button being held down. At 60-120Hz this costs well under a
+ * tenth of a second before the pointer engages. */
+#define JOYCON2_SURFACE_DEBOUNCE 4
+
 /* ZMK's mouse report carries signed 8-bit deltas. */
 #define JOYCON2_MOUSE_DELTA_MIN (-127)
 #define JOYCON2_MOUSE_DELTA_MAX 127
@@ -53,6 +62,8 @@ struct joycon2_mouse_side {
     int16_t last_x;
     int16_t last_y;
     bool on_surface;
+    /* Readings seen so far that disagree with on_surface, for the debounce. */
+    uint8_t surface_streak;
     /* Click state, so a release is only sent for a click actually held. */
     bool left_held;
     bool right_held;
@@ -143,9 +154,17 @@ void zmk_joycon2_mouse_update(enum zmk_joycon2_side side, int16_t raw_x, int16_t
                                uint8_t distance, uint32_t buttons, uint16_t stick_x_raw,
                                uint16_t stick_y_raw) {
     struct joycon2_mouse_side *s = &sides[side_index(side)];
-    bool on_surface = (distance == JOYCON2_SURFACE_TOUCHING);
 
-    s->on_surface = on_surface;
+    /* Debounced rather than taken as read -- see JOYCON2_SURFACE_DEBOUNCE. */
+    bool reading = (distance == JOYCON2_SURFACE_TOUCHING);
+    if (reading == s->on_surface) {
+        s->surface_streak = 0;
+    } else if (++s->surface_streak >= JOYCON2_SURFACE_DEBOUNCE) {
+        s->on_surface = reading;
+        s->surface_streak = 0;
+    }
+    bool on_surface = s->on_surface;
+
     update_owner(side, on_surface);
 
     if (!on_surface) {

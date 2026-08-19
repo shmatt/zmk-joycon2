@@ -443,8 +443,15 @@ void zmk_joycon2_gamepad_update(enum zmk_joycon2_side side, uint32_t buttons, ui
         }
 #if IS_ENABLED(CONFIG_ZMK_JOYCON2_MOUSE)
         /* While this half is driving the pointer, its shoulder pair is the
-         * mouse's clicks, so it must not also fire as R1/R2 (or L1/L2). */
-        if ((mask & mouse_click_masks(side)) && zmk_joycon2_mouse_owns(side)) {
+         * mouse's clicks, so it must not also fire as R1/R2 (or L1/L2).
+         *
+         * A button already held keeps its role until it is physically
+         * released, though: the pointer may only claim it on a fresh press.
+         * Re-deciding mid-hold means the pointer taking over releases a button
+         * the user is still holding, and a host that acts on the release --
+         * a game, rather than a state-viewing tester -- sees the action stop. */
+        if ((mask & mouse_click_masks(side)) && zmk_joycon2_mouse_owns(side) &&
+            !(st->pressed_slots & BIT(i))) {
             continue;
         }
 #endif
