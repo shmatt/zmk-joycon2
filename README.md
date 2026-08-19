@@ -248,6 +248,16 @@ name: `0` means *touching* a surface, higher means airborne. Discard the first
 sample after landing, or the stale-versus-fresh difference throws the pointer
 across the screen.
 
+**Skin and clothing do not read as a surface.** Resting a half on a leg leaves
+`[0x17]` airborne, so the pointer does not engage — presumably the sensor's own
+quality check rather than deliberate filtering, but the effect is what matters:
+holding a controller against yourself does not trip mouse mode. Do not rely on
+it for a hand wrapped around the rail at close range, though, and note that
+`[0x17]` sits right on the threshold when a half is held just *above* a surface.
+Debounce it: a single-report decision toggles at the report rate, and if
+ownership also decides what the shoulder buttons do, that releases and
+re-presses a button being held.
+
 **Stick calibration lives at `0x000130A8` for both halves.** A stick travels
 only about ±1200 of the raw 12-bit span, so scaling by the full half-span
 reports roughly half scale at full tilt. Reference implementations read a
